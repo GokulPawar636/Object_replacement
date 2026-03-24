@@ -111,7 +111,7 @@ def solid_row_fill(mask):
     return solid
 
 
-conf_thresh = st.slider("Confidence threshold", 0.1, 0.8, 0.25, 0.05)
+conf_thresh = st.slider("Confidence threshold", 0.1, 0.8, 0.15, 0.05)
 
 def delaunay_mesh(edge_mask, interior_mask, extra_points, h, w, grid_step):
     """
@@ -277,8 +277,20 @@ def process_video(video_path, selected_classes, color_bgr, grid_step, line_thick
                                               interpolation=cv2.INTER_NEAREST)
                     combined_mask = cv2.bitwise_or(combined_mask, bin_mask)
 
+        # 🔥 Remove thin noise (fingers)
+        kernel = np.ones((5, 5), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+        
+        # 🔥 Keep only largest object (removes small parts like fingers)
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            new_mask = np.zeros_like(combined_mask)
+            cv2.drawContours(new_mask, [largest], -1, 255, -1)
+            combined_mask = new_mask
         if np.sum(combined_mask) == 0:
-            if prev_mask is not None and miss_count < 3:
+            if prev_mask is not None:
                 combined_mask = prev_mask.copy()
                 miss_count += 1
             else:
@@ -294,7 +306,7 @@ def process_video(video_path, selected_classes, color_bgr, grid_step, line_thick
         combined_mask = cv2.resize(combined_mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
 
         edge_mask = combined_mask
-        interior_mask = solid_row_fill(edge_mask)
+        interior_mask = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8))
 
         y_coords, x_coords = np.where(edge_mask > 0)
         if len(x_coords) > 0:
