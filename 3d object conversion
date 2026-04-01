@@ -1,0 +1,616 @@
+"""
+Object Mesh — 2D Delaunay mesh + 3D reconstruction via COLMAP
+==================================================================
+- Detects non‑human objects in video, lets you pick class(es).
+- Option A: Generate 2D Delaunay mesh frames (with/without background).
+- Option B: Reconstruct a 3D model (point cloud / textured mesh) of the selected object using COLMAP.
+"""
+
+import subprocess
+import sys
+import importlib
+import streamlit as st
+import cv2
+import numpy as np
+import tempfile
+import time
+import os
+import shutil
+import io
+import zipfile
+
+# ----------------------------------------------------------------------
+# Helper: install missing packages
+# ----------------------------------------------------------------------
+def _pip(pkg, mod=None):
+    try:
+        importlib.import_module(mod or pkg.replace("-", "_").split("[")[0])
+    except ImportError:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+# Install core packages
+_pip("opencv-python", "cv2")
+_pip("numpy")
+_pip("streamlit")
+_pip("ultralytics")
+_pip("imageio-ffmpeg", "imageio_ffmpeg")
+_pip("scipy")
+
+# Try to import pycolmap; install if missing
+try:
+    import pycolmap
+except ImportError:
+    with st.spinner("Installing pycolmap (CPU version)..."):
+        _pip("pycolmap")
+    import pycolmap
+
+from ultralytics import YOLO
+import imageio_ffmpeg
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+# ----------------------------------------------------------------------
+# Streamlit page config
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="Object Mesh + 3D", page_icon="🎨", layout="centered")
+st.title("🎨 Object Mesh & 3D Reconstruction")
+st.markdown("Detect non‑human objects → choose which to process → generate 2D mesh frames or a 3D model.")
+st.divider()
+
+# ----------------------------------------------------------------------
+# Load YOLOv8 segmentation model (cached)
+# ----------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_yolo():
+    model_path = "yolov8m-seg.pt"
+    if not os.path.exists(model_path):
+        with st.spinner("⬇️ Downloading YOLOv8‑seg model (~6 MB)…"):
+            pass
+    model = YOLO(model_path)
+    return model
+
+with st.spinner("Loading YOLOv8‑seg…"):
+    yolo_model = load_yolo()
+st.success("✅ Ready")
+st.divider()
+
+# ----------------------------------------------------------------------
+# Settings sidebar
+# ----------------------------------------------------------------------
+st.subheader("⚙️ 2D Mesh Settings")
+with st.container():
+    col1, col2 = st.columns(2)
+    with col1:
+        mesh_color_hex = st.color_picker("Mesh color", "#00AAFF")
+        grid_step = st.slider("Mesh density (lower = denser)", 16, 56, 22)
+        line_thick = st.slider("Line thickness", 1, 3, 1)
+    with col2:
+        show_nodes = st.checkbox("Show landmark nodes", True)
+        output_w = st.selectbox("Output width (px)", [540, 720, 1080])
+        mesh_only = st.checkbox("Mesh only (no background)", value=False)
+
+conf_thresh = st.slider("Confidence threshold", 0.1, 0.8, 0.15, 0.05)
+
+st.divider()
+# ----------------------------------------------------------------------
+# Upload video
+# ----------------------------------------------------------------------
+uploaded = st.file_uploader("📹 Upload a video", type=["mp4", "avi", "mov", "mkv"])
+
+# ----------------------------------------------------------------------
+# Helper functions for 2D mesh
+# ----------------------------------------------------------------------
+def hex_bgr(h):
+    h = h.lstrip("#")
+    return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
+
+def solid_row_fill(mask):
+    h, w = mask.shape[:2]
+    solid = np.zeros_like(mask)
+    for y in range(h):
+        nz = np.where(mask[y, :] > 0)[0]
+        if len(nz) > 5:
+            solid[y, nz[0]:nz[-1] + 1] = 255
+    return solid
+
+def delaunay_mesh(edge_mask, interior_mask, extra_points, h, w, grid_step):
+    contours, _ = cv2.findContours(edge_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return [], None
+    largest = max(contours, key=cv2.contourArea)
+    simp = cv2.approxPolyDP(largest, 1.5, True)
+    max_pts = 120
+    if len(simp) > max_pts:
+        step = max(1, len(simp) // max_pts)
+        contour_pts = [(int(simp[i][0][0]), int(simp[i][0][1]))
+                       for i in range(0, len(simp), step)
+                       if 0 < simp[i][0][0] < w and 0 < simp[i][0][1] < h]
+    else:
+        contour_pts = [(int(pt[0][0]), int(pt[0][1])) for pt in simp
+                       if 0 < pt[0][0] < w and 0 < pt[0][1] < h]
+
+    interior_float = interior_mask.astype(np.float32) / 255.0
+    ys, xs = np.where(interior_mask > 0)
+    if len(xs) > 0:
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+        grid_pts = [(gx, gy)
+                    for gy in range(ymin, ymax, grid_step)
+                    for gx in range(xmin, xmax, grid_step)
+                    if interior_float[gy, gx] > 0.5]
+    else:
+        grid_pts = []
+
+    all_pts = list(set(contour_pts + grid_pts + extra_points))
+    if len(all_pts) < 4:
+        return [], largest
+
+    subdiv = cv2.Subdiv2D((0, 0, w, h))
+    for p in all_pts:
+        try:
+            subdiv.insert(p)
+        except:
+            pass
+    triangles = []
+    for x1, y1, x2, y2, x3, y3 in subdiv.getTriangleList():
+        cx = (int(x1) + int(x2) + int(x3)) // 3
+        cy = (int(y1) + int(y2) + int(y3)) // 3
+        if 0 < cx < w and 0 < cy < h and interior_float[cy, cx] > 0.25:
+            triangles.append((int(x1), int(y1), int(x2), int(y2), int(x3), int(y3)))
+    return triangles, largest
+
+def draw_layer(canvas, triangles, contour, color, line_thick, fill_alpha=0.15):
+    if not triangles:
+        return
+    if len(canvas.shape) != 3 or canvas.shape[2] != 3:
+        st.warning("Canvas is not a 3‑channel BGR image – skipping draw_layer")
+        return
+
+    overlay = canvas.copy()
+    fill_color = tuple(max(0, int(c * 0.07)) for c in color)
+
+    for x1, y1, x2, y2, x3, y3 in triangles:
+        pts = np.array([[x1, y1], [x2, y2], [x3, y3]], dtype=np.int32)
+        cv2.fillPoly(overlay, [pts], fill_color)
+
+    blended = (overlay.astype(np.float32) * fill_alpha +
+               canvas.astype(np.float32) * (1 - fill_alpha))
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    canvas[:] = blended
+
+    for x1, y1, x2, y2, x3, y3 in triangles:
+        pts = np.array([[x1, y1], [x2, y2], [x3, y3]], dtype=np.int32)
+        cv2.polylines(canvas, [pts], True, color, line_thick, cv2.LINE_AA)
+
+    if contour is not None:
+        cv2.drawContours(canvas, [contour], -1, color, 2, cv2.LINE_AA)
+
+def process_video_save_frames(video_path, selected_classes, color_bgr, grid_step, line_thick, show_nodes, out_w, mesh_only):
+    """Original 2D mesh frame generator."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    scale = out_w / max(orig_w, 1)
+    out_w = out_w
+    out_h = int(orig_h * scale) & ~1
+
+    img_dir = tempfile.mkdtemp()
+
+    prog_bar = st.progress(0, "Processing frames...")
+    status_text = st.empty()
+    start_time = time.time()
+    frame_idx = 0
+
+    prev_mask = None
+    miss_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_small = cv2.resize(frame, (out_w, out_h))
+
+        results = yolo_model(frame, conf=conf_thresh, verbose=False)[0]
+
+        combined_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        if results.masks is not None:
+            for mask, cls in zip(results.masks.data.cpu().numpy(), results.boxes.cls.cpu().numpy()):
+                class_name = yolo_model.names[int(cls)]
+                if class_name.lower() == "person":
+                    continue
+                if class_name in selected_classes:
+                    bin_mask = (mask > 0.5).astype(np.uint8) * 255
+                    if bin_mask.shape != combined_mask.shape:
+                        bin_mask = cv2.resize(bin_mask, (combined_mask.shape[1], combined_mask.shape[0]),
+                                              interpolation=cv2.INTER_NEAREST)
+                    combined_mask = cv2.bitwise_or(combined_mask, bin_mask)
+
+        kernel = np.ones((5, 5), np.uint8)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            new_mask = np.zeros_like(combined_mask)
+            cv2.drawContours(new_mask, [largest], -1, 255, -1)
+            combined_mask = new_mask
+
+        if np.sum(combined_mask) == 0:
+            if prev_mask is not None:
+                combined_mask = prev_mask.copy()
+                miss_count += 1
+            else:
+                if mesh_only:
+                    blank = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+                    img_path = os.path.join(img_dir, f"frame_{frame_idx:06d}.jpg")
+                    cv2.imwrite(img_path, blank)
+                else:
+                    img_path = os.path.join(img_dir, f"frame_{frame_idx:06d}.jpg")
+                    cv2.imwrite(img_path, frame_small)
+                frame_idx += 1
+                prog_bar.progress(min(frame_idx / total_frames, 1.0),
+                                  text=f"Frame {frame_idx}/{total_frames}")
+                continue
+        else:
+            prev_mask = combined_mask.copy()
+            miss_count = 0
+
+        combined_mask = cv2.resize(combined_mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+
+        edge_mask = combined_mask
+        interior_mask = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8))
+
+        y_coords, x_coords = np.where(edge_mask > 0)
+        if len(x_coords) > 0:
+            cx = int(np.mean(x_coords))
+            cy = int(np.mean(y_coords))
+            extra_pts = [(cx, cy)]
+        else:
+            extra_pts = []
+
+        tris, contour = delaunay_mesh(edge_mask, interior_mask, extra_pts,
+                                      out_h, out_w, grid_step)
+
+        if mesh_only:
+            canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        else:
+            canvas = frame_small.copy()
+
+        draw_layer(canvas, tris, contour, color_bgr, line_thick, fill_alpha=0.15)
+
+        if show_nodes:
+            for (x, y) in extra_pts:
+                cv2.circle(canvas, (x, y), 4, (0, 255, 180), -1, cv2.LINE_AA)
+                cv2.circle(canvas, (x, y), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+        img_path = os.path.join(img_dir, f"frame_{frame_idx:06d}.jpg")
+        cv2.imwrite(img_path, canvas)
+
+        frame_idx += 1
+        elapsed = time.time() - start_time
+        fps_est = frame_idx / elapsed if elapsed > 0 else 0
+        eta = (total_frames - frame_idx) / max(fps_est, 1e-3)
+        prog_bar.progress(min(frame_idx / total_frames, 1.0),
+                          text=f"Frame {frame_idx}/{total_frames} · {fps_est:.1f} fps · ETA {eta:.0f}s")
+        if frame_idx % 30 == 0:
+            status_text.image(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB),
+                              use_container_width=True)
+
+    cap.release()
+    prog_bar.empty()
+    status_text.empty()
+    return img_dir, frame_idx, elapsed
+
+# ----------------------------------------------------------------------
+# Object detection helper (needed for both 2D and 3D masking)
+# ----------------------------------------------------------------------
+def get_objects_from_frame(frame):
+    results = yolo_model(frame, verbose=False)[0]
+    objects = []
+    if results.masks is not None:
+        for i, (box, mask, cls, conf) in enumerate(zip(
+            results.boxes.xyxy.cpu().numpy(),
+            results.masks.data.cpu().numpy(),
+            results.boxes.cls.cpu().numpy(),
+            results.boxes.conf.cpu().numpy()
+        )):
+            class_name = yolo_model.names[int(cls)]
+            if class_name.lower() == "person":
+                continue
+            objects.append({
+                "id": i,
+                "class": class_name,
+                "confidence": float(conf),
+                "bbox": box,
+                "mask": mask
+            })
+    return objects
+
+# ----------------------------------------------------------------------
+# 3D reconstruction with COLMAP
+# ----------------------------------------------------------------------
+def run_colmap_on_frames(image_dir, output_dir, sparse_only=True):
+    """
+    Run COLMAP reconstruction on a folder of images.
+    If sparse_only=True, exports a sparse point cloud (PLY) and the COLMAP model.
+    If sparse_only=False, attempts dense reconstruction (mesh + texture) – requires CUDA.
+    Returns path to the final result (PLY or mesh folder) or None on failure.
+    """
+    db_path = os.path.join(output_dir, "database.db")
+    sparse_dir = os.path.join(output_dir, "sparse")
+    os.makedirs(sparse_dir, exist_ok=True)
+
+    # 1. Feature extraction
+    pycolmap.extract_features(db_path, image_dir)
+
+    # 2. Feature matching (exhaustive for small datasets)
+    pycolmap.match_exhaustive(db_path)
+
+    # 3. Incremental reconstruction
+    maps = pycolmap.incremental_mapping(db_path, image_dir, sparse_dir)
+
+    if not maps:
+        st.error("COLMAP reconstruction failed: no valid model.")
+        return None
+
+    model = maps[0]
+
+    # Write the full COLMAP model to the sparse directory
+    model.write(sparse_dir)
+
+    # Export sparse point cloud as PLY
+    ply_path = os.path.join(sparse_dir, "points3D.ply")
+    try:
+        model.export_PLY(ply_path)
+    except AttributeError:
+        # Fallback: create PLY from points3D
+        points = model.points3D
+        if points:
+            with open(ply_path, 'w') as f:
+                f.write("ply\nformat ascii 1.0\n")
+                f.write(f"element vertex {len(points)}\n")
+                f.write("property float x\nproperty float y\nproperty float z\n")
+                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+                f.write("end_header\n")
+                for pt_id, pt in points.items():
+                    xyz = pt.xyz
+                    rgb = pt.color
+                    f.write(f"{xyz[0]} {xyz[1]} {xyz[2]} {rgb[0]} {rgb[1]} {rgb[2]}\n")
+
+    if sparse_only:
+        return ply_path
+
+    # ---------- DENSE RECONSTRUCTION (requires CUDA) ----------
+    st.info("Attempting dense reconstruction (requires CUDA). This may take a long time.")
+    dense_dir = os.path.join(output_dir, "dense")
+    os.makedirs(dense_dir, exist_ok=True)
+
+    try:
+        # Undistort images
+        pycolmap.undistort_images(dense_dir, sparse_dir, image_dir)
+
+        # Patch-match stereo (requires CUDA)
+        pycolmap.patch_match_stereo(dense_dir)
+
+        # Fusion into dense point cloud
+        fused_ply = os.path.join(dense_dir, "fused.ply")
+        pycolmap.stereo_fusion(dense_dir, fused_ply)
+
+        # Meshing (Poisson or Delaunay)
+        meshed_ply = os.path.join(dense_dir, "meshed.ply")
+        try:
+            pycolmap.poisson_meshing(dense_dir, meshed_ply)
+        except AttributeError:
+            pycolmap.delaunay_meshing(dense_dir, meshed_ply)
+
+        st.success("Dense reconstruction completed!")
+        return meshed_ply
+
+    except Exception as e:
+        # If any error occurs (likely CUDA not available), fall back to sparse
+        st.warning(f"Dense reconstruction failed: {e}. Falling back to sparse model.")
+        return ply_path
+
+def extract_raw_frames(video_path, output_dir, selected_classes, use_masks, out_w=720):
+    """
+    Extract frames from video, optionally applying masks to isolate selected object(s).
+    Returns number of frames extracted.
+    """
+    cap = cv2.VideoCapture(video_path)
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    scale = out_w / max(orig_w, 1)
+    out_h = int(orig_h * scale) & ~1
+
+    frame_count = 0
+    prev_mask = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if use_masks:
+            results = yolo_model(frame, conf=conf_thresh, verbose=False)[0]
+            combined_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+            if results.masks is not None:
+                for mask, cls in zip(results.masks.data.cpu().numpy(), results.boxes.cls.cpu().numpy()):
+                    class_name = yolo_model.names[int(cls)]
+                    if class_name.lower() == "person":
+                        continue
+                    if class_name in selected_classes:
+                        bin_mask = (mask > 0.5).astype(np.uint8) * 255
+                        if bin_mask.shape != combined_mask.shape:
+                            bin_mask = cv2.resize(bin_mask, (combined_mask.shape[1], combined_mask.shape[0]),
+                                                  interpolation=cv2.INTER_NEAREST)
+                        combined_mask = cv2.bitwise_or(combined_mask, bin_mask)
+
+            kernel = np.ones((5,5), np.uint8)
+            combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+            contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                new_mask = np.zeros_like(combined_mask)
+                cv2.drawContours(new_mask, [largest], -1, 255, -1)
+                combined_mask = new_mask
+
+            if np.sum(combined_mask) == 0 and prev_mask is not None:
+                combined_mask = prev_mask.copy()
+            else:
+                prev_mask = combined_mask.copy()
+
+            mask_resized = cv2.resize(combined_mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+            frame_resized = cv2.resize(frame, (out_w, out_h))
+            masked_frame = cv2.bitwise_and(frame_resized, frame_resized, mask=mask_resized)
+            out_frame = masked_frame
+        else:
+            out_frame = cv2.resize(frame, (out_w, out_h))
+
+        img_path = os.path.join(output_dir, f"{frame_count:06d}.jpg")
+        cv2.imwrite(img_path, out_frame)
+        frame_count += 1
+
+    cap.release()
+    return frame_count
+
+# ----------------------------------------------------------------------
+# Main interaction
+# ----------------------------------------------------------------------
+if uploaded is not None:
+    st.video(uploaded)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(uploaded.read())
+        tmp_path = tmp.name
+
+    # Read first frame to detect objects
+    cap = cv2.VideoCapture(tmp_path)
+    ret, first_frame = cap.read()
+    cap.release()
+    if not ret:
+        st.error("Could not read video file.")
+        st.stop()
+
+    with st.spinner("Detecting objects in first frame..."):
+        detected_objects = get_objects_from_frame(first_frame)
+
+    unique_classes = sorted(set(obj["class"] for obj in detected_objects))
+
+    if not unique_classes:
+        st.warning("No non‑human objects detected in the first frame. Try a different video.")
+    else:
+        st.subheader("🔍 Detected object classes")
+        selected_classes = []
+        cols = st.columns(2)
+        for i, cls in enumerate(unique_classes):
+            with cols[i % 2]:
+                if st.checkbox(cls, key=f"class_{cls}"):
+                    selected_classes.append(cls)
+
+        if not selected_classes:
+            st.info("Select at least one object class to process.")
+        else:
+            st.divider()
+            st.subheader("📦 3D Model Reconstruction (COLMAP)")
+            with st.container():
+                col1, col2 = st.columns(2)
+                with col1:
+                    frame_source = st.radio("Frame source for 3D", ["Raw frames", "Masked frames (object only)"], index=1)
+                    recon_type = st.radio("Reconstruction type", ["Sparse (point cloud)", "Dense (mesh + texture)"], index=0)
+                with col2:
+                    recon_width = st.selectbox("Frame width for reconstruction", [540, 720, 1080], index=1)
+
+            if st.button("🔄 Reconstruct 3D Model", type="primary", use_container_width=True):
+                frames_dir = tempfile.mkdtemp()
+                try:
+                    with st.spinner("Extracting frames..."):
+                        use_masks = (frame_source == "Masked frames (object only)")
+                        num_frames = extract_raw_frames(tmp_path, frames_dir, selected_classes, use_masks, recon_width)
+                        st.info(f"Extracted {num_frames} frames.")
+
+                    if num_frames < 5:
+                        st.error("Too few frames (need at least 5). Try a longer video or reduce frame width.")
+                    else:
+                        out_dir = tempfile.mkdtemp()
+                        with st.spinner("Running COLMAP (this may take a while)..."):
+                            sparse_only = (recon_type == "Sparse (point cloud)")
+                            model_path = run_colmap_on_frames(frames_dir, out_dir, sparse_only)
+
+                        if model_path and os.path.exists(model_path):
+                            zip_buffer = io.BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                # Add the main output file
+                                zf.write(model_path, os.path.basename(model_path))
+                                # Also add the entire sparse/dense folders for completeness
+                                if sparse_only:
+                                    # Add sparse folder (cameras, images, points)
+                                    for root, _, files in os.walk(os.path.join(out_dir, "sparse")):
+                                        for file in files:
+                                            full_path = os.path.join(root, file)
+                                            arcname = os.path.relpath(full_path, out_dir)
+                                            zf.write(full_path, arcname)
+                                else:
+                                    # Add the dense folder (meshed.ply and texture if any)
+                                    for root, _, files in os.walk(os.path.join(out_dir, "dense")):
+                                        for file in files:
+                                            full_path = os.path.join(root, file)
+                                            arcname = os.path.relpath(full_path, out_dir)
+                                            zf.write(full_path, arcname)
+                            zip_buffer.seek(0)
+                            st.success("3D reconstruction completed!")
+                            st.download_button(
+                                label="📥 Download 3D Model (ZIP)",
+                                data=zip_buffer,
+                                file_name="object_3d_model.zip",
+                                mime="application/zip",
+                                use_container_width=True
+                            )
+                        else:
+                            st.error("COLMAP reconstruction failed. Check the frames (need enough texture and motion).")
+                except Exception as e:
+                    st.error(f"An error occurred: {e}")
+                finally:
+                    shutil.rmtree(frames_dir, ignore_errors=True)
+                    if 'out_dir' in locals():
+                        shutil.rmtree(out_dir, ignore_errors=True)
+
+            st.divider()
+            st.subheader("🎨 2D Mesh Frames (Delaunay)")
+            if st.button("▶️ Generate 2D Mesh Frames", type="secondary", use_container_width=True):
+                color_bgr = hex_bgr(mesh_color_hex)
+                img_dir, frames_processed, elapsed = process_video_save_frames(
+                    tmp_path, selected_classes, color_bgr,
+                    grid_step, line_thick, show_nodes, output_w, mesh_only
+                )
+                st.success(f"✅ Done – {frames_processed} frames · {elapsed:.1f}s · {frames_processed/elapsed:.1f} fps")
+
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    for root, _, files in os.walk(img_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, img_dir)
+                            zip_file.write(file_path, arcname)
+                zip_buffer.seek(0)
+
+                st.download_button(
+                    label="📥 Download 2D Mesh Frames (ZIP)",
+                    data=zip_buffer,
+                    file_name="object_mesh_frames.zip",
+                    mime="application/zip",
+                    use_container_width=True
+                )
+                shutil.rmtree(img_dir, ignore_errors=True)
+
+    # Clean up the temporary video file
+    try:
+        os.unlink(tmp_path)
+    except:
+        pass
