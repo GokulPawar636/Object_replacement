@@ -1,0 +1,459 @@
+"""
+3D Model Meshing & UV Unwrapping Tool
+Supports: .glb, .gltf (with .bin), .obj, .stl, .ply, .off
+"""
+
+import streamlit as st
+import numpy as np
+import trimesh
+import xatlas
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import matplotlib.collections as mc
+import tempfile, os, io, json, zipfile
+from pathlib import Path
+
+# ─── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="3D Mesh & UV Unwrap Tool",
+    page_icon="🧊",
+    layout="wide",
+)
+
+st.markdown("""
+<style>
+    .main { background: #0e1117; }
+    .stApp { background: #0e1117; }
+    h1 { color: #00d4ff; font-family: 'Courier New', monospace; }
+    h2, h3 { color: #7ec8e3; }
+    .metric-box {
+        background: #1a1f2e;
+        border: 1px solid #00d4ff33;
+        border-radius: 8px;
+        padding: 12px 18px;
+        text-align: center;
+    }
+    .stButton>button {
+        background: linear-gradient(135deg, #00d4ff, #0088cc);
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-weight: bold;
+        padding: 0.5em 2em;
+    }
+    .stButton>button:hover {
+        background: linear-gradient(135deg, #00aaff, #006699);
+    }
+    .upload-hint {
+        background: #1a1f2e;
+        border: 1px dashed #00d4ff55;
+        border-radius: 10px;
+        padding: 16px;
+        color: #7ec8e3;
+        font-size: 0.9em;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🧊 3D Mesh & UV Unwrap Tool")
+st.caption("Upload a 3D model → analyze mesh → generate UV atlas → export results")
+
+# ─── Sidebar Options ──────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Options")
+
+    st.subheader("Mesh Processing")
+    fix_normals    = st.checkbox("Fix normals",        value=True)
+    merge_verts    = st.checkbox("Merge duplicate vertices", value=True)
+    remove_degen   = st.checkbox("Remove degenerate faces",  value=True)
+    fill_holes     = st.checkbox("Fill holes",         value=False)
+
+    st.subheader("UV Unwrapping (xatlas)")
+    max_chart_angle = st.slider("Max chart angle (°)",   10, 90, 70,
+        help="Higher = fewer, larger UV charts")
+    uv_padding      = st.slider("UV island padding (px)", 0, 16, 4)
+    texel_density   = st.slider("Texel density",          64, 1024, 512, step=64,
+        help="Target texture resolution for packing")
+
+    st.subheader("Visualization")
+    wireframe_opacity = st.slider("Wireframe opacity", 0.0, 1.0, 0.3)
+    show_normals      = st.checkbox("Show normals",   value=False)
+
+    st.markdown("---")
+    st.markdown("**Supported formats**")
+    st.markdown("`.glb` `.gltf+bin` `.obj` `.stl` `.ply` `.off`")
+
+# ─── File Upload ──────────────────────────────────────────────────────────────
+st.header("📂 Upload Model")
+
+col_hint, _ = st.columns([2, 1])
+with col_hint:
+    st.markdown("""
+    <div class='upload-hint'>
+    <b>⚠️ GLTF note:</b> If uploading a <code>.gltf</code> file, you <b>must also upload</b>
+    the companion <code>.bin</code> file — both are required. For a single-file upload, use <b>.glb</b> instead.
+    </div>
+    """, unsafe_allow_html=True)
+
+uploaded_files = st.file_uploader(
+    "Upload 3D model file(s)",
+    type=["glb", "gltf", "bin", "obj", "stl", "ply", "off"],
+    accept_multiple_files=True,
+)
+
+
+def load_mesh_from_uploads(files: list) -> trimesh.Trimesh | None:
+    """Write uploads to temp dir, load with trimesh."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        saved = {}
+        for f in files:
+            dest = os.path.join(tmpdir, f.name)
+            with open(dest, "wb") as out:
+                out.write(f.getbuffer())
+            saved[f.name] = dest
+
+        # Find the primary model file
+        primary = None
+        for name, path in saved.items():
+            ext = Path(name).suffix.lower()
+            if ext in {".glb", ".gltf", ".obj", ".stl", ".ply", ".off"}:
+                primary = path
+                break
+
+        if primary is None:
+            return None
+
+        try:
+            scene_or_mesh = trimesh.load(primary, force="mesh")
+            if isinstance(scene_or_mesh, trimesh.Scene):
+                meshes = [g for g in scene_or_mesh.geometry.values()
+                          if isinstance(g, trimesh.Trimesh)]
+                if not meshes:
+                    st.error("Scene contains no triangle meshes.")
+                    return None
+                mesh = trimesh.util.concatenate(meshes)
+            else:
+                mesh = scene_or_mesh
+            return mesh
+        except Exception as e:
+            st.error(f"Failed to load model: {e}")
+            return None
+
+
+def clean_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    if merge_verts:
+        mesh.merge_vertices()
+    if remove_degen:
+        mask = mesh.nondegenerate_faces()
+        mesh.update_faces(mask)
+    if fix_normals:
+        mesh.fix_normals()
+    if fill_holes:
+        trimesh.repair.fill_holes(mesh)
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def make_3d_figure(mesh: trimesh.Trimesh, title="3D Mesh") -> go.Figure:
+    v, f = mesh.vertices, mesh.faces
+    fig = go.Figure()
+
+    # Solid faces
+    fig.add_trace(go.Mesh3d(
+        x=v[:, 0], y=v[:, 1], z=v[:, 2],
+        i=f[:, 0], j=f[:, 1], k=f[:, 2],
+        color="#00aaff", opacity=0.7,
+        name="Mesh", showscale=False,
+        lighting=dict(ambient=0.4, diffuse=0.8, specular=0.2),
+    ))
+
+    # Wireframe edges (subsample for performance)
+    edges_x, edges_y, edges_z = [], [], []
+    step = max(1, len(f) // 2000)
+    for tri in f[::step]:
+        for a, b in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]:
+            edges_x += [v[a, 0], v[b, 0], None]
+            edges_y += [v[a, 1], v[b, 1], None]
+            edges_z += [v[a, 2], v[b, 2], None]
+    fig.add_trace(go.Scatter3d(
+        x=edges_x, y=edges_y, z=edges_z,
+        mode="lines",
+        line=dict(color="#00d4ff", width=1),
+        opacity=wireframe_opacity,
+        name="Wireframe",
+    ))
+
+    if show_normals:
+        centers = v[f].mean(axis=1)[::max(1, len(f)//500)]
+        norms   = mesh.face_normals[::max(1, len(f)//500)] * 0.15
+        for c, n in zip(centers, norms):
+            fig.add_trace(go.Scatter3d(
+                x=[c[0], c[0]+n[0]], y=[c[1], c[1]+n[1]], z=[c[2], c[2]+n[2]],
+                mode="lines", line=dict(color="yellow", width=2),
+                showlegend=False,
+            ))
+
+    fig.update_layout(
+        title=title,
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
+        scene=dict(
+            bgcolor="#1a1f2e",
+            xaxis=dict(showgrid=False, zeroline=False),
+            yaxis=dict(showgrid=False, zeroline=False),
+            zaxis=dict(showgrid=False, zeroline=False),
+        ),
+        margin=dict(l=0, r=0, t=40, b=0),
+        font=dict(color="#7ec8e3"),
+    )
+    return fig
+
+
+def run_uv_unwrap(mesh: trimesh.Trimesh):
+    """Run xatlas UV unwrapping; returns (vmapping, indices, uvs)."""
+    positions = mesh.vertices.astype(np.float32)
+    faces     = mesh.faces.astype(np.uint32)
+    normals   = mesh.vertex_normals.astype(np.float32)
+
+    vmapping, indices, uvs = xatlas.parametrize(positions, faces, normals)
+    return vmapping, indices, uvs
+
+
+def uv_chart_figure(uvs, indices, title="UV Atlas"):
+    """Render UV layout using matplotlib."""
+    fig, ax = plt.subplots(figsize=(6, 6), facecolor="#1a1f2e")
+    ax.set_facecolor("#0e1117")
+
+    # ── Ensure uvs is strictly shape (N, 2) ──────────────────────────────────
+    uvs_2d = np.array(uvs, dtype=np.float32).reshape(-1, 2)
+    indices_flat = np.array(indices, dtype=np.int32).flatten()
+
+    segs = []
+    n_tris = len(indices_flat) // 3
+    step = max(1, n_tris // 8000)
+    for i in range(0, n_tris, step):
+        base = i * 3
+        ia, ib, ic = int(indices_flat[base]), int(indices_flat[base+1]), int(indices_flat[base+2])
+        # Guard against out-of-bounds indices
+        if max(ia, ib, ic) >= len(uvs_2d):
+            continue
+        ua = uvs_2d[ia].tolist()   # plain [u, v]
+        ub = uvs_2d[ib].tolist()
+        uc = uvs_2d[ic].tolist()
+        segs.append([ua, ub])
+        segs.append([ub, uc])
+        segs.append([uc, ua])
+
+    lc = mc.LineCollection(segs, colors="#00d4ff", linewidths=0.4, alpha=0.6)
+    ax.add_collection(lc)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.set_title(title, color="#7ec8e3", fontsize=12)
+    ax.tick_params(colors="#7ec8e3")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#00d4ff44")
+    ax.set_xlabel("U", color="#7ec8e3")
+    ax.set_ylabel("V", color="#7ec8e3")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+def export_obj_with_uv(mesh, vmapping, indices, uvs) -> str:
+    """Build OBJ string with UV coordinates."""
+    # Normalise all arrays to safe flat shapes
+    vmapping_flat = np.array(vmapping, dtype=np.int32).flatten()
+    indices_flat  = np.array(indices,  dtype=np.int32).flatten()
+    uvs_2d        = np.array(uvs,      dtype=np.float32).reshape(-1, 2)
+
+    # Clamp vmapping so we never exceed mesh.vertices length
+    vmapping_flat = np.clip(vmapping_flat, 0, len(mesh.vertices) - 1)
+    new_verts = mesh.vertices[vmapping_flat]
+
+    max_uv = len(uvs_2d) - 1  # highest valid UV index
+
+    lines = ["# Exported by 3D Mesh & UV Unwrap Tool", ""]
+
+    for v in new_verts:
+        lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+    lines.append("")
+
+    for uv in uvs_2d:
+        lines.append(f"vt {uv[0]:.6f} {uv[1]:.6f}")
+    lines.append("")
+
+    for i in range(0, len(indices_flat) - 2, 3):
+        # Clamp each index to valid range; OBJ indices are 1-based
+        a = int(np.clip(indices_flat[i],   0, max_uv)) + 1
+        b = int(np.clip(indices_flat[i+1], 0, max_uv)) + 1
+        c = int(np.clip(indices_flat[i+2], 0, max_uv)) + 1
+        lines.append(f"f {a}/{a} {b}/{b} {c}/{c}")
+
+    return "\n".join(lines)
+
+
+# ─── Main Processing ──────────────────────────────────────────────────────────
+if not uploaded_files:
+    st.info("👆 Upload a 3D model file above to get started.")
+
+    with st.expander("ℹ️ How it works"):
+        st.markdown("""
+        1. **Upload** your 3D model (`.glb`, `.obj`, `.stl`, `.ply`)
+        2. **Mesh Analysis** — vertex/face counts, watertight check, bounding box
+        3. **Cleaning** — merge verts, fix normals, remove degenerate faces
+        4. **UV Unwrapping** — automatic UV atlas via [xatlas](https://github.com/jpcy/xatlas)
+        5. **Export** — download cleaned `.obj` + UV-mapped `.obj` as a ZIP
+        """)
+    st.stop()
+
+# ── Load ──
+with st.spinner("Loading model..."):
+    mesh_raw = load_mesh_from_uploads(uploaded_files)
+
+if mesh_raw is None:
+    st.stop()
+
+# ── Clean ──
+with st.spinner("Cleaning mesh..."):
+    mesh = clean_mesh(mesh_raw.copy())
+
+# ─── Stats ────────────────────────────────────────────────────────────────────
+st.header("📊 Mesh Analysis")
+
+bb = mesh.bounds
+bb_size = bb[1] - bb[0]
+cols = st.columns(6)
+stats = [
+    ("Vertices",   f"{len(mesh.vertices):,}"),
+    ("Faces",      f"{len(mesh.faces):,}"),
+    ("Edges",      f"{len(mesh.edges_unique):,}"),
+    ("Watertight", "✅ Yes" if mesh.is_watertight else "❌ No"),
+    ("Volume",     f"{mesh.volume:.3f}" if mesh.is_watertight else "N/A"),
+    ("Euler #",    str(mesh.euler_number)),
+]
+for col, (label, val) in zip(cols, stats):
+    col.markdown(
+        f"<div class='metric-box'><b style='color:#00d4ff'>{val}</b><br>"
+        f"<small style='color:#7ec8e3'>{label}</small></div>",
+        unsafe_allow_html=True,
+    )
+
+st.caption(
+    f"Bounding box: "
+    f"X [{bb[0,0]:.3f}, {bb[1,0]:.3f}] | "
+    f"Y [{bb[0,1]:.3f}, {bb[1,1]:.3f}] | "
+    f"Z [{bb[0,2]:.3f}, {bb[1,2]:.3f}]"
+)
+
+# ─── 3D Viewer ────────────────────────────────────────────────────────────────
+st.header("🔭 3D Viewer")
+st.plotly_chart(make_3d_figure(mesh, "Cleaned Mesh"), use_container_width=True)
+
+# ─── UV Unwrapping ────────────────────────────────────────────────────────────
+st.header("🗺️ UV Unwrapping")
+
+if st.button("▶ Run UV Unwrap"):
+    with st.spinner("Running xatlas UV parametrization…"):
+        try:
+            vmapping, indices, uvs = run_uv_unwrap(mesh)
+            st.session_state["uv_result"] = (vmapping, indices, uvs)
+            st.success(
+                f"✅ UV unwrap complete! "
+                f"New vertex count: {len(vmapping):,} | "
+                f"UV coords: {len(uvs):,}"
+            )
+        except Exception as e:
+            st.error(f"UV unwrap failed: {e}")
+
+if "uv_result" in st.session_state:
+    vmapping, indices, uvs = st.session_state["uv_result"]
+
+    col_uv, col_info = st.columns([2, 1])
+
+    with col_uv:
+        st.subheader("UV Atlas Layout")
+        uv_img = uv_chart_figure(uvs, indices)
+        st.image(uv_img, use_container_width=True)
+
+    with col_info:
+        st.subheader("UV Stats")
+        uv_min = uvs.min(axis=0)
+        uv_max = uvs.max(axis=0)
+
+        # Estimate UV coverage via rasterization (robust, no ConvexHull shape issues)
+        try:
+            uv_flat = np.array(uvs).reshape(-1, 2)   # ensure (N, 2)
+            uv_flat = np.clip(uv_flat, 0.0, 1.0)
+            grid_res = 256
+            grid = np.zeros((grid_res, grid_res), dtype=bool)
+            px = (uv_flat[:, 0] * (grid_res - 1)).astype(int)
+            py = (uv_flat[:, 1] * (grid_res - 1)).astype(int)
+            grid[py, px] = True
+            coverage = grid.sum() / grid.size
+        except Exception:
+            coverage = 0.0
+
+        info_data = {
+            "UV verts":    f"{len(uvs):,}",
+            "UV triangles": f"{len(indices)//3:,}",
+            "U range":     f"[{uv_min[0]:.3f}, {uv_max[0]:.3f}]",
+            "V range":     f"[{uv_min[1]:.3f}, {uv_max[1]:.3f}]",
+            "Approx coverage": f"{coverage*100:.1f}%",
+        }
+        for k, v in info_data.items():
+            st.markdown(
+                f"<div class='metric-box' style='margin-bottom:8px'>"
+                f"<b style='color:#00d4ff'>{v}</b><br>"
+                f"<small style='color:#7ec8e3'>{k}</small></div>",
+                unsafe_allow_html=True,
+            )
+
+    # ─── Export ───────────────────────────────────────────────────────────────
+    st.header("💾 Export")
+
+    col_e1, col_e2, col_e3 = st.columns(3)
+
+    # OBJ with UV
+    obj_uv = export_obj_with_uv(mesh, vmapping, indices, uvs)
+    col_e1.download_button(
+        "⬇ Download UV-mapped OBJ",
+        data=obj_uv.encode(),
+        file_name="mesh_uv.obj",
+        mime="text/plain",
+    )
+
+    # Clean mesh as OBJ (no UV)
+    obj_buf = io.BytesIO()
+    mesh.export(obj_buf, file_type="obj")
+    col_e2.download_button(
+        "⬇ Download Cleaned OBJ",
+        data=obj_buf.getvalue(),
+        file_name="mesh_clean.obj",
+        mime="text/plain",
+    )
+
+    # ZIP with everything
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mesh_uv.obj",    obj_uv)
+        obj_buf.seek(0)
+        zf.writestr("mesh_clean.obj", obj_buf.read())
+        uv_img.seek(0)
+        zf.writestr("uv_atlas.png",   uv_img.read())
+        # UV coords as numpy text
+        uv_txt = "\n".join(f"{u:.6f} {v:.6f}" for u, v in uvs)
+        zf.writestr("uv_coords.txt",  uv_txt)
+    zip_buf.seek(0)
+    col_e3.download_button(
+        "⬇ Download All (ZIP)",
+        data=zip_buf.getvalue(),
+        file_name="mesh_unwrap_export.zip",
+        mime="application/zip",
+    )
+
+st.markdown("---")
+st.caption("Built with trimesh · xatlas · plotly · streamlit")
