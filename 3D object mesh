@@ -1,7 +1,7 @@
 """
-GLTF UV Unwrap + Texture Mapping Pipeline
-Upload: scene.gltf + scene.bin + all texture images from textures/ folder
-Pipeline: Load → Extract embedded UVs → Match textures by mesh name → Apply per-vertex colour → 3D visualization
+3D Mesh & UV Unwrap Tool  –  v5
+Low Poly / High Poly structured quad meshing  +  UV unwrap  +  export
+Like the hippo reference: quad grid flowing over the surface
 """
 
 import streamlit as st
@@ -11,144 +11,99 @@ import xatlas
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
 import matplotlib.collections as mc
-from PIL import Image
-import tempfile, os, io, zipfile, re, shutil
+import tempfile, os, io, zipfile, time
 from pathlib import Path
-from typing import Optional
+from collections import defaultdict
 
-# ─── Page config ──────────────────────────────────────────────────────────────
-st.set_page_config(page_title="GLTF Texture Mapper", page_icon="🎨", layout="wide")
-
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="3D Mesh Tool", page_icon="🦛", layout="wide")
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;500;700&display=swap');
-    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-    .stApp { background: #080b10; }
-    h1 { font-family: 'Space Mono', monospace !important; font-size: 1.85rem !important;
-         color: #f0f4ff; letter-spacing: -1px; }
-    h2, h3 { font-family: 'Space Mono', monospace !important; color: #c9d4f0; font-size: 1rem !important; }
-    .step-badge {
-        display: inline-block; background: linear-gradient(135deg, #1e3a5f, #0f2040);
-        border: 1px solid #2a5298; border-radius: 20px; padding: 4px 14px;
-        font-family: 'Space Mono', monospace; font-size: 0.7rem; color: #6eaaff;
-        margin-bottom: 8px; letter-spacing: 1px; text-transform: uppercase;
-    }
-    .stat-card {
-        background: #0d1420; border: 1px solid #1a2540; border-radius: 8px;
-        padding: 14px 16px; text-align: center;
-    }
-    .stat-val { font-family: 'Space Mono', monospace; font-size: 1.1rem; color: #6eaaff; font-weight: 700; }
-    .stat-lbl { font-size: 0.7rem; color: #4a5a78; margin-top: 2px; text-transform: uppercase; letter-spacing: 1px; }
-    .match-ok   { background:#0a1c10; border-left:3px solid #22c55e; padding:8px 14px;
-                  border-radius:6px; margin:3px 0; font-family:'Space Mono',monospace; font-size:0.75rem; color:#86efac; }
-    .match-miss { background:#1a0f0f; border-left:3px solid #ef4444; padding:8px 14px;
-                  border-radius:6px; margin:3px 0; font-family:'Space Mono',monospace; font-size:0.75rem; color:#fca5a5; }
-    .match-skip { background:#111318; border-left:3px solid #555; padding:8px 14px;
-                  border-radius:6px; margin:3px 0; font-family:'Space Mono',monospace; font-size:0.75rem; color:#888; }
-    .stButton>button {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2a5298 100%) !important;
-        color: #c9d4f0 !important; border: 1px solid #3a62a8 !important;
-        border-radius: 6px !important; font-family: 'Space Mono', monospace !important;
-        font-size: 0.8rem !important; font-weight: 700 !important; padding: 0.55em 1.8em !important;
-    }
-    .stButton>button:hover { background: linear-gradient(135deg,#2a5298 0%,#3a72c8 100%) !important; }
-    .stDownloadButton>button {
-        background: linear-gradient(135deg,#1a3a1a 0%,#2a6a2a 100%) !important;
-        border-color: #3a8a3a !important; color: #90ee90 !important;
-    }
-    div[data-testid="stSidebar"] { background:#060911; border-right:1px solid #141c2e; }
-    div[data-testid="stSidebar"] label { color:#8899bb !important; font-size:0.83rem !important; }
-    .stCheckbox label { color:#8899bb !important; }
+body,.stApp{background:#111318;color:#d0d7de}
+h1{color:#e6edf3;font-family:'Courier New',monospace;letter-spacing:1px}
+h2,h3{color:#79c0ff}
+.metric-box{background:#161b22;border:1px solid #30363d;border-radius:8px;
+            padding:12px;text-align:center;margin:4px 0}
+.stButton>button{background:linear-gradient(135deg,#1f6feb,#388bfd);
+                 color:white;border:none;border-radius:6px;
+                 font-weight:bold;padding:.5em 2em;width:100%}
+.stButton>button:hover{background:linear-gradient(135deg,#388bfd,#58a6ff)}
+.hint-box{background:#161b22;border:1px dashed #388bfd44;
+          border-radius:8px;padding:12px;color:#8b949e;font-size:.87em}
+.poly-card{border-radius:10px;padding:14px 18px;text-align:center;
+           font-weight:bold;font-size:1.05em;margin:4px 0;border:2px solid}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎨 GLTF Texture Mapping Pipeline")
-st.caption("Upload `scene.gltf` + `scene.bin` + all texture images → auto UV-map → textured 3D view")
+st.title("🦛 3D Mesh Tool — Low & High Poly Quad Meshing")
+st.caption("Structured quad grid · UV unwrap · low / high poly control · export OBJ")
 
-# ─── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Settings")
-    fix_normals       = st.checkbox("Fix normals",              value=True)
-    merge_verts       = st.checkbox("Merge duplicate vertices", value=True)
-    remove_degen      = st.checkbox("Remove degenerate faces",  value=True)
+    st.header("⚙️ Settings")
+
+    st.subheader("🎚️ Poly Mode")
+    poly_mode = st.radio(
+        "Mesh density",
+        ["Low Poly", "High Poly", "Custom"],
+        index=0,
+        help="Low = few large quads, High = many fine quads, Custom = your own value"
+    )
+    if poly_mode == "Low Poly":
+        quad_res = 8
+    elif poly_mode == "High Poly":
+        quad_res = 28
+    else:
+        quad_res = st.slider("Grid resolution (N)", 4, 50, 15,
+            help="Number of quad rows per surface patch. Higher = finer grid.")
+
+    smooth_passes = st.slider("Smoothing passes", 0, 6, 2,
+        help="Laplacian smoothing — reduces voxel stepping artifacts")
+
+    st.subheader("🎨 Display")
+    show_wire      = st.checkbox("Show quad wireframe", True)
+    wire_color     = st.selectbox("Wire color", ["Black","White","Blue","Yellow"], index=0)
+    wire_opacity   = st.slider("Wire opacity", 0.1, 1.0, 0.7)
+    face_color     = st.color_picker("Face color", "#c0d8f0")
+    show_uv        = st.checkbox("Show UV unwrap", True)
+
+    st.subheader("Mesh Cleaning")
+    merge_verts  = st.checkbox("Merge vertices",         True)
+    fix_normals  = st.checkbox("Fix normals",            True)
+    remove_degen = st.checkbox("Remove degenerate faces",True)
+
     st.markdown("---")
-    wireframe_opacity = st.slider("Wireframe opacity", 0.0, 1.0, 0.1)
-    use_xatlas        = st.checkbox("xatlas fallback (meshes without UVs)", value=True)
-    st.markdown("---")
-    st.markdown("**What to upload**")
-    st.markdown("- `scene.gltf`\n- `scene.bin`\n- All `.png` / `.jpg` from `textures/` folder")
+    st.markdown("**Formats:** `.glb` `.gltf+bin` `.obj` `.stl` `.ply` `.off`")
+
+WIRE_COLORS = {"Black":"rgba(0,0,0,X)","White":"rgba(255,255,255,X)",
+               "Blue":"rgba(56,139,253,X)","Yellow":"rgba(255,210,0,X)"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MESH LOADING & CLEANING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_mesh(files):
+    with tempfile.TemporaryDirectory() as tmp:
+        primary = None
+        for f in files:
+            p = os.path.join(tmp, f.name)
+            with open(p,"wb") as out: out.write(f.getbuffer())
+            if Path(f.name).suffix.lower() in {".glb",".gltf",".obj",".stl",".ply",".off"}:
+                primary = p
+        if not primary:
+            st.error("No 3D model file recognised."); return None
+        try:
+            loaded = trimesh.load(primary, force="mesh")
+            if isinstance(loaded, trimesh.Scene):
+                meshes = [g for g in loaded.geometry.values()
+                          if isinstance(g, trimesh.Trimesh)]
+                loaded = trimesh.util.concatenate(meshes) if meshes else None
+            return loaded
+        except Exception as e:
+            st.error(f"Load failed: {e}"); return None
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  NAME-BASED TEXTURE MATCHING
-# ════════════════════════════════════════════════════════════════════════════
-
-def normalize_name(s: str) -> set:
-    s = s.lower()
-    for suf in ["_basecolor","_base_color","_diffuse","_albedo","_color",
-                "_col","_tex","_texture","_d","_bc","_material","_mat"]:
-        s = s.replace(suf, "")
-    for pre in ["sm_","mi_","m_","mesh_","geo_","obj_","mat_","texture_","tex_"]:
-        if s.startswith(pre): s = s[len(pre):]
-    return set(t for t in re.split(r"[^a-z0-9]+", s) if len(t) > 1)
-
-
-def score_match(mesh_name: str, tex_stem: str) -> int:
-    m = normalize_name(mesh_name)
-    t = normalize_name(tex_stem)
-    if not m or not t: return 0
-    overlap = m & t
-    if m == t:           return 100
-    if m.issubset(t):    return 50 + len(m)
-    if overlap:          return len(overlap) * 10
-    return 0
-
-
-def pick_texture(mesh_name: str, texture_files) -> object:
-    PREFERRED = ["basecolor","base_color","diffuse","albedo","color","col"]
-    preferred = [t for t in texture_files
-                 if any(k in t.name.lower() for k in PREFERRED)]
-    pool = preferred if preferred else list(texture_files)
-    best, best_score = None, 0
-    for tex in pool:
-        s = score_match(mesh_name, Path(tex.name).stem)
-        if s > best_score:
-            best, best_score = tex, s
-    return best if best_score > 0 else None
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  LOAD GLTF SCENE  (keeps per-mesh geometry + embedded UVs)
-# ════════════════════════════════════════════════════════════════════════════
-
-def load_scene(files) -> tuple:
-    """Write all uploaded files to a temp dir, load with trimesh."""
-    tmpdir = tempfile.mkdtemp()
-    for f in files:
-        dest = os.path.join(tmpdir, f.name)
-        with open(dest, "wb") as out:
-            out.write(f.getbuffer())
-
-    primary = next(
-        (os.path.join(tmpdir, f.name) for f in files
-         if Path(f.name).suffix.lower() in {".glb",".gltf",".obj",".stl",".ply",".off"}),
-        None)
-
-    if not primary:
-        st.error("No recognised 3D model file found (.gltf, .glb, .obj …)")
-        return None, tmpdir
-
-    try:
-        scene = trimesh.load(primary, force="scene")
-        if not isinstance(scene, trimesh.Scene):
-            scene = trimesh.scene.scene.Scene(geometry={"mesh": scene})
-        return scene, tmpdir
-    except Exception as e:
-        st.error(f"Load error: {e}")
-        return None, tmpdir
-
-
-def clean_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def clean_mesh(mesh):
     if merge_verts:  mesh.merge_vertices()
     if remove_degen: mesh.update_faces(mesh.nondegenerate_faces())
     if fix_normals:  mesh.fix_normals()
@@ -156,443 +111,498 @@ def clean_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return mesh
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  UV SAMPLING
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  STRUCTURED QUAD REMESHING
+#  Strategy: voxelize → marching cubes (uniform tris) → pair tris into quads
+#  This gives the "quad grid flowing over surface" look from the reference image
+# ══════════════════════════════════════════════════════════════════════════════
 
-def sample_via_embedded_uv(geom: trimesh.Trimesh, img: Image.Image) -> np.ndarray:
-    """Sample texture at each vertex using the mesh's own UV coords → RGBA uint8."""
-    uv  = np.clip(np.array(geom.visual.uv, dtype=np.float32), 0.0, 1.0)
-    tex = np.array(img.convert("RGBA"), dtype=np.uint8)
-    H, W = tex.shape[:2]
-    px = np.clip((uv[:,0]*(W-1)).astype(int), 0, W-1)
-    py = np.clip(((1-uv[:,1])*(H-1)).astype(int), 0, H-1)
-    return tex[py, px]   # shape (N_verts, 4)
-
-
-def sample_via_xatlas(geom: trimesh.Trimesh, img: Image.Image):
+def make_structured_quads(mesh, res, smooth):
     """
-    Run xatlas UV unwrap, then sample texture.
-    Returns (vertex_colors_per_original_vert [N,4], new_indices, new_uvs, vmapping)
+    Build a structured quad mesh:
+    1. Voxelize at resolution `res` → uniform cubic lattice
+    2. Extract surface (marching cubes) → near-uniform triangles
+    3. Laplacian smooth → removes stair-step voxel artifacts
+    4. Pair adjacent triangles sharing hypotenuse → quads
+    Returns: (vertices, quads_np, surf_mesh, stats)
     """
-    vm, idx, uvs = xatlas.parametrize(
-        geom.vertices.astype(np.float32),
-        geom.faces.astype(np.uint32),
-        geom.vertex_normals.astype(np.float32)
-    )
-    vm   = np.clip(np.array(vm,  dtype=np.int32).flatten(),  0, len(geom.vertices)-1)
-    uvs2 = np.clip(np.array(uvs, dtype=np.float32).reshape(-1,2), 0.0, 1.0)
-    tex  = np.array(img.convert("RGBA"), dtype=np.uint8)
-    H, W = tex.shape[:2]
-    px = np.clip((uvs2[:,0]*(W-1)).astype(int), 0, W-1)
-    py = np.clip(((1-uvs2[:,1])*(H-1)).astype(int), 0, H-1)
-    # Map colours back to original vertex indices
-    vcols = np.zeros((len(geom.vertices), 4), dtype=np.uint8)
-    vcols[vm] = tex[py, px]
-    return vcols
+    pitch = mesh.extents.max() / float(res)
+    pitch = max(pitch, 1e-7)
 
+    # Step 1+2: voxelise → surface
+    vox  = mesh.voxelized(pitch=pitch)
+    surf = vox.marching_cubes
 
-# ════════════════════════════════════════════════════════════════════════════
-#  MAIN TEXTURE APPLICATION
-# ════════════════════════════════════════════════════════════════════════════
-
-def apply_textures(scene: trimesh.Scene, texture_files):
-    preview_meshes, match_log = [], []
-
-    for geom_name, geom in scene.geometry.items():
-        if not isinstance(geom, trimesh.Trimesh):
-            match_log.append({"mesh": geom_name, "status": "skip", "reason": "not a Trimesh"})
-            continue
-
-        geom = clean_mesh(geom.copy())
-
-        # ── Check for embedded UV coords ─────────────────────────────────
-        has_uv = (
-            hasattr(geom.visual, "uv")
-            and geom.visual.uv is not None
-            and len(geom.visual.uv) == len(geom.vertices)
-        )
-
-        # ── Find matching texture ─────────────────────────────────────────
-        tex_file = pick_texture(geom_name, texture_files)
-
-        if tex_file is None:
-            match_log.append({"mesh": geom_name, "status": "miss", "reason": "no matching texture"})
-            continue
-
+    # Step 3: smooth
+    if smooth > 0:
         try:
-            tex_file.seek(0)
+            surf = trimesh.smoothing.filter_laplacian(surf, iterations=smooth)
         except Exception:
             pass
+    surf.fix_normals()
+    surf.remove_unreferenced_vertices()
 
-        img = Image.open(tex_file).convert("RGBA")
+    # Step 4: pair triangles → quads
+    faces = surf.faces
+    edge_face = defaultdict(list)
+    for fi, tri in enumerate(faces):
+        for a, b in [(tri[0],tri[1]),(tri[1],tri[2]),(tri[2],tri[0])]:
+            key = (min(int(a),int(b)), max(int(a),int(b)))
+            edge_face[key].append(fi)
 
-        # ── Apply ─────────────────────────────────────────────────────────
-        try:
-            if has_uv:
-                vcols    = sample_via_embedded_uv(geom, img)
-                uv_src   = "embedded GLTF UV"
-            elif use_xatlas:
-                vcols    = sample_via_xatlas(geom, img)
-                uv_src   = "xatlas (generated)"
-            else:
-                match_log.append({"mesh": geom_name, "status": "skip", "reason": "no UV coords"})
-                continue
+    quads, used = [], set()
+    for fi, tri in enumerate(faces):
+        if fi in used: continue
+        for a, b in [(tri[0],tri[1]),(tri[1],tri[2]),(tri[2],tri[0])]:
+            key = (min(int(a),int(b)), max(int(a),int(b)))
+            nbs  = [f for f in edge_face[key] if f != fi and f not in used]
+            if nbs:
+                tj    = faces[nbs[0]]
+                all_v = list(set(list(tri) + list(tj)))
+                if len(all_v) == 4:
+                    # sort quad vertices into consistent winding
+                    v0 = surf.vertices[all_v]
+                    center = v0.mean(axis=0)
+                    angles = np.arctan2(
+                        (v0 - center)[:,1],
+                        (v0 - center)[:,0]
+                    )
+                    order = np.argsort(angles)
+                    quads.append([all_v[i] for i in order])
+                    used.add(fi); used.add(nbs[0])
+                    break
+        else:
+            used.add(fi)
 
-            preview = geom.copy()
-            preview.visual = trimesh.visual.ColorVisuals(mesh=preview, vertex_colors=vcols)
-            preview_meshes.append(preview)
-            match_log.append({
-                "mesh": geom_name, "status": "ok",
-                "texture": tex_file.name, "uv_source": uv_src,
-                "verts": len(geom.vertices), "faces": len(geom.faces)
-            })
+    quads_np = np.array(quads, np.int32) if quads else np.zeros((0,4), np.int32)
+    coverage = len(quads_np)*2 / max(len(faces),1) * 100
 
-        except Exception as e:
-            match_log.append({"mesh": geom_name, "status": "miss", "reason": str(e)})
+    stats = {
+        "input_faces":  len(mesh.faces),
+        "quad_faces":   len(quads_np),
+        "vertices":     len(surf.vertices),
+        "tri_faces":    len(faces),
+        "coverage":     coverage,
+        "pitch":        pitch,
+        "res":          res,
+    }
+    return surf.vertices, quads_np, surf, stats
 
-    return preview_meshes, match_log
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  3D VIEWER — quad grid on surface like the hippo reference
+# ══════════════════════════════════════════════════════════════════════════════
+
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2],16) for i in (0,2,4))
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  UV ATLAS VIEWER
-# ════════════════════════════════════════════════════════════════════════════
+def make_quad_figure(vertices, quads_np, surf_mesh, title="Quad Mesh"):
+    v = vertices
+    fig = go.Figure()
 
-def render_uv_atlas(scene: trimesh.Scene) -> io.BytesIO:
-    fig, ax = plt.subplots(figsize=(5,5), facecolor="#0d1420")
-    ax.set_facecolor("#080b10")
-    drawn = 0
-    for geom in scene.geometry.values():
-        if not isinstance(geom, trimesh.Trimesh): continue
-        if not (hasattr(geom.visual,"uv") and geom.visual.uv is not None
-                and len(geom.visual.uv) == len(geom.vertices)): continue
-        uvs  = np.array(geom.visual.uv, dtype=np.float32).reshape(-1,2)
-        f    = geom.faces
-        step = max(1, len(f)//4000)
-        segs = []
+    # ── Solid face layer ──────────────────────────────────────────────────────
+    if len(quads_np) > 0:
+        # split quads → tris for Mesh3d
+        ti = np.concatenate([quads_np[:,0], quads_np[:,0]])
+        tj = np.concatenate([quads_np[:,1], quads_np[:,2]])
+        tk = np.concatenate([quads_np[:,2], quads_np[:,3]])
+        r,g,b = hex_to_rgb(face_color)
+        fig.add_trace(go.Mesh3d(
+            x=v[:,0], y=v[:,1], z=v[:,2],
+            i=ti, j=tj, k=tk,
+            color=f"rgb({r},{g},{b})",
+            opacity=1.0,
+            flatshading=False,
+            lighting=dict(ambient=0.45, diffuse=0.8, specular=0.15,
+                          roughness=0.6, fresnel=0.05),
+            lightposition=dict(x=100, y=200, z=300),
+        ))
+    else:
+        # fallback: solid triangles
+        f = surf_mesh.faces
+        fig.add_trace(go.Mesh3d(
+            x=v[:,0],y=v[:,1],z=v[:,2],
+            i=f[:,0],j=f[:,1],k=f[:,2],
+            color=face_color, opacity=1.0,
+        ))
+
+    # ── Quad wireframe grid ───────────────────────────────────────────────────
+    if show_wire and len(quads_np) > 0:
+        ex, ey, ez = [], [], []
+        step = max(1, len(quads_np) // 4000)
+        for q in quads_np[::step]:
+            # draw 4 edges of the quad (no diagonal)
+            for a, b in [(q[0],q[1]),(q[1],q[2]),(q[2],q[3]),(q[3],q[0])]:
+                ex += [v[a,0], v[b,0], None]
+                ey += [v[a,1], v[b,1], None]
+                ez += [v[a,2], v[b,2], None]
+        wc = WIRE_COLORS[wire_color].replace("X", str(wire_opacity))
+        fig.add_trace(go.Scatter3d(
+            x=ex, y=ey, z=ez, mode="lines",
+            line=dict(color=wc, width=1.2),
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(color="#79c0ff", size=13)),
+        paper_bgcolor="#111318",
+        scene=dict(
+            bgcolor="#161b22",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            zaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, t=45, b=0),
+        font=dict(color="#8b949e"),
+        showlegend=False,
+    )
+    return fig
+
+
+def make_original_figure(mesh, title="Original"):
+    v, f = mesh.vertices, mesh.faces
+    fig = go.Figure()
+    fig.add_trace(go.Mesh3d(
+        x=v[:,0],y=v[:,1],z=v[:,2],
+        i=f[:,0],j=f[:,1],k=f[:,2],
+        color="#c0d8f0", opacity=1.0,
+        flatshading=False,
+        lighting=dict(ambient=0.45, diffuse=0.8, specular=0.1),
+    ))
+    if show_wire:
+        ex,ey,ez=[],[],[]
+        step=max(1,len(f)//3000)
         for tri in f[::step]:
-            if max(tri) >= len(uvs): continue
-            ua,ub,uc = uvs[tri[0]].tolist(), uvs[tri[1]].tolist(), uvs[tri[2]].tolist()
-            segs += [[ua,ub],[ub,uc],[uc,ua]]
-        if segs:
-            lc = mc.LineCollection(segs, colors="#6eaaff", linewidths=0.35, alpha=0.6)
-            ax.add_collection(lc); drawn += 1
+            for a,b in [(tri[0],tri[1]),(tri[1],tri[2]),(tri[2],tri[0])]:
+                ex+=[v[a,0],v[b,0],None]; ey+=[v[a,1],v[b,1],None]; ez+=[v[a,2],v[b,2],None]
+        wc = WIRE_COLORS[wire_color].replace("X","0.5")
+        fig.add_trace(go.Scatter3d(x=ex,y=ey,z=ez,mode="lines",
+            line=dict(color=wc,width=0.8),showlegend=False))
+    fig.update_layout(
+        title=dict(text=title,font=dict(color="#8b949e",size=12)),
+        paper_bgcolor="#111318",
+        scene=dict(bgcolor="#161b22",
+            xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
+            yaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
+            zaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
+            aspectmode="data"),
+        margin=dict(l=0,r=0,t=35,b=0),
+        font=dict(color="#8b949e"), showlegend=False,
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UV UNWRAP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_uv(mesh):
+    pos   = np.ascontiguousarray(mesh.vertices,       np.float32)
+    faces = np.ascontiguousarray(mesh.faces,          np.uint32)
+    norms = np.ascontiguousarray(mesh.vertex_normals, np.float32)
+    pos   = np.nan_to_num(pos); norms = np.nan_to_num(norms)
+    vmapping, indices, uvs = xatlas.parametrize(pos, faces, norms)
+    uvs_2d     = np.array(uvs,     np.float32).reshape(-1,2)
+    indices_2d = np.clip(np.array(indices, np.int32).reshape(-1,3), 0, len(uvs_2d)-1)
+    return vmapping, indices_2d, uvs_2d
+
+
+def uv_figure(uvs_2d, indices_2d):
+    fig, ax = plt.subplots(figsize=(5,5), facecolor="#111318")
+    ax.set_facecolor("#161b22")
+
+    segs = []
+    step = max(1, len(indices_2d)//6000)
+    for fi in range(0, len(indices_2d), step):
+        tri = uvs_2d[indices_2d[fi]]
+        for a,b in [(0,1),(1,2),(2,0)]:
+            segs.append([tri[a].tolist(), tri[b].tolist()])
+    if segs:
+        ax.add_collection(mc.LineCollection(segs, colors="#388bfd",
+                                            linewidths=0.35, alpha=0.7))
     ax.set_xlim(0,1); ax.set_ylim(0,1); ax.set_aspect("equal")
-    ax.set_title(f"UV Atlas — {drawn} mesh(es)", color="#c9d4f0", fontsize=10)
-    ax.set_xlabel("U", color="#4a5a78"); ax.set_ylabel("V", color="#4a5a78")
-    ax.tick_params(colors="#4a5a78")
-    for s in ax.spines.values(): s.set_edgecolor("#1a2540")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    ax.set_title("UV Atlas", color="#79c0ff", fontsize=11, pad=6)
+    ax.set_xlabel("U",color="#8b949e"); ax.set_ylabel("V",color="#8b949e")
+    ax.tick_params(colors="#8b949e")
+    for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+    ax.set_xticks(np.arange(0,1.1,0.25)); ax.set_yticks(np.arange(0,1.1,0.25))
+    ax.grid(color="#30363d",linewidth=0.4,alpha=0.5)
+    buf=io.BytesIO()
+    fig.savefig(buf,format="png",dpi=140,bbox_inches="tight",facecolor=fig.get_facecolor())
     buf.seek(0); plt.close(fig)
     return buf
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  PLOTLY 3D FIGURES
-# ════════════════════════════════════════════════════════════════════════════
-
-def _style(fig, title):
-    fig.update_layout(
-        title=dict(text=title, font=dict(color="#c9d4f0", family="Space Mono", size=13)),
-        paper_bgcolor="#080b10", plot_bgcolor="#080b10",
-        scene=dict(bgcolor="#0d1420",
-                   xaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
-                   yaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
-                   zaxis=dict(showgrid=False,zeroline=False,showticklabels=False),
-                   aspectmode="data"),
-        margin=dict(l=0,r=0,t=40,b=0),
-        font=dict(color="#8899bb"),
-    )
-
-
-def make_plain_fig(scene: trimesh.Scene, title="Base Mesh") -> go.Figure:
-    fig = go.Figure()
-    for geom in scene.geometry.values():
-        if not isinstance(geom, trimesh.Trimesh): continue
-        v, f = geom.vertices, geom.faces
-        fig.add_trace(go.Mesh3d(
-            x=v[:,0],y=v[:,1],z=v[:,2],
-            i=f[:,0],j=f[:,1],k=f[:,2],
-            color="#2a5298", opacity=0.85, flatshading=False,
-            lighting=dict(ambient=0.5,diffuse=0.8,specular=0.2),
-        ))
-        step = max(1, len(f)//1500)
-        ex,ey,ez=[],[],[]
-        for tri in f[::step]:
-            for a,b in [(tri[0],tri[1]),(tri[1],tri[2]),(tri[2],tri[0])]:
-                ex+=[v[a,0],v[b,0],None]; ey+=[v[a,1],v[b,1],None]; ez+=[v[a,2],v[b,2],None]
-        fig.add_trace(go.Scatter3d(x=ex,y=ey,z=ez,mode="lines",
-            line=dict(color="#6eaaff",width=1),opacity=wireframe_opacity,showlegend=False))
-    _style(fig, title)
-    return fig
-
-
-def make_textured_fig(meshes: list, title="Textured Mesh") -> go.Figure:
-    fig = go.Figure()
-    for mesh in meshes:
-        v, f = mesh.vertices, mesh.faces
-        vc   = mesh.visual.vertex_colors
-        colors = [f"rgb({c[0]},{c[1]},{c[2]})" for c in vc]
-        fig.add_trace(go.Mesh3d(
-            x=v[:,0],y=v[:,1],z=v[:,2],
-            i=f[:,0],j=f[:,1],k=f[:,2],
-            vertexcolor=colors, opacity=1.0, flatshading=False,
-        ))
-        step = max(1, len(f)//1500)
-        ex,ey,ez=[],[],[]
-        for tri in f[::step]:
-            for a,b in [(tri[0],tri[1]),(tri[1],tri[2]),(tri[2],tri[0])]:
-                ex+=[v[a,0],v[b,0],None]; ey+=[v[a,1],v[b,1],None]; ez+=[v[a,2],v[b,2],None]
-        fig.add_trace(go.Scatter3d(x=ex,y=ey,z=ez,mode="lines",
-            line=dict(color="#000",width=0.4),opacity=wireframe_opacity*0.4,showlegend=False))
-    _style(fig, title)
-    return fig
-
-
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  EXPORT
-# ════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
-def export_obj(meshes: list) -> str:
-    lines = ["# Exported by GLTF Texture Mapper", ""]
-    v_offset = 1
-    for mesh in meshes:
-        v, f = mesh.vertices, mesh.faces
-        vc   = mesh.visual.vertex_colors
-        for vi in v:  lines.append(f"v {vi[0]:.6f} {vi[1]:.6f} {vi[2]:.6f}")
-        for c  in vc: lines.append(f"vc {c[0]} {c[1]} {c[2]}")
-        lines.append("")
-        for tri in f:
-            a,b,c2 = tri[0]+v_offset, tri[1]+v_offset, tri[2]+v_offset
-            lines.append(f"f {a} {b} {c2}")
-        lines.append("")
-        v_offset += len(v)
+def export_quad_obj(vertices, quads_np, fallback_faces=None):
+    lines=["# Quad mesh OBJ",""]
+    for vv in vertices:
+        lines.append(f"v {vv[0]:.6f} {vv[1]:.6f} {vv[2]:.6f}")
+    lines.append("")
+    if len(quads_np)>0:
+        for q in quads_np:
+            lines.append(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}")
+    elif fallback_faces is not None:
+        for tri in fallback_faces:
+            lines.append(f"f {tri[0]+1} {tri[1]+1} {tri[2]+1}")
     return "\n".join(lines)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  UPLOAD UI
-# ════════════════════════════════════════════════════════════════════════════
+def export_uv_obj(mesh, vmapping, indices_2d, uvs_2d):
+    vm  = np.clip(np.array(vmapping,np.int32).flatten(), 0, len(mesh.vertices)-1)
+    idx = indices_2d.flatten()
+    mx  = len(uvs_2d)-1
+    nv  = mesh.vertices[vm]
+    lines=["# UV-mapped OBJ",""]
+    for vv in nv: lines.append(f"v {vv[0]:.6f} {vv[1]:.6f} {vv[2]:.6f}")
+    lines.append("")
+    for uv in uvs_2d: lines.append(f"vt {uv[0]:.6f} {uv[1]:.6f}")
+    lines.append("")
+    for i in range(0,len(idx)-2,3):
+        a=int(np.clip(idx[i],  0,mx))+1
+        b=int(np.clip(idx[i+1],0,mx))+1
+        c=int(np.clip(idx[i+2],0,mx))+1
+        lines.append(f"f {a}/{a} {b}/{b} {c}/{c}")
+    return "\n".join(lines)
 
-st.markdown('<div class="step-badge">Step 1 — Upload Files</div>', unsafe_allow_html=True)
 
-st.markdown("""
-<div style="background:#0d1420;border:1px solid #1a3050;border-radius:8px;
-            padding:14px 18px;margin-bottom:14px;font-size:0.85rem;color:#8899bb;">
-  <b style="color:#6eaaff">Upload all together in the two uploaders below:</b><br><br>
-  &nbsp;&nbsp;📄 <code>scene.gltf</code> &emsp; 📦 <code>scene.bin</code>
-  &emsp; 🖼 <b>all</b> PNG/JPG images from your <code>textures/</code> folder
-  <br><br>
-  <span style="color:#4a5a78;font-size:0.78rem;">
-  The .gltf references geometry from .bin and textures by filename —
-  all three parts are required for a correct result.
-  </span>
-</div>
-""", unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN UI
+# ══════════════════════════════════════════════════════════════════════════════
 
-col_model, col_tex = st.columns(2)
+st.header("📂 Upload 3D Model")
+st.markdown("""<div class='hint-box'>
+<b>GLTF:</b> upload both <code>.gltf</code> + <code>.bin</code> together.
+For a single file use <b>.glb</b> (Blender: File → Export → glTF → GLB).
+</div>""", unsafe_allow_html=True)
 
-with col_model:
-    model_files = st.file_uploader(
-        "📦 Model files — scene.gltf + scene.bin",
-        type=["gltf","glb","bin","obj","stl","ply","off"],
-        accept_multiple_files=True,
-    )
+uploaded = st.file_uploader(
+    "Drop 3D model file(s)",
+    type=["glb","gltf","bin","obj","stl","ply","off"],
+    accept_multiple_files=True,
+)
 
-with col_tex:
-    texture_files = st.file_uploader(
-        "🖼 Texture images — all files from textures/ folder",
-        type=["png","jpg","jpeg","webp"],
-        accept_multiple_files=True,
-    )
-
-if not model_files:
-    st.info("👆 Upload your model files to begin.")
-    with st.expander("ℹ️ Pipeline overview"):
+if not uploaded:
+    st.info("👆 Upload a 3D model to get started.")
+    with st.expander("ℹ️ How it works"):
         st.markdown("""
-        | Step | What happens |
-        |------|-------------|
-        | **Upload** | `scene.gltf` + `scene.bin` + all PNGs from `textures/` |
-        | **Load** | trimesh loads the full scene, preserving per-mesh geometry & embedded UVs |
-        | **Clean** | Merge duplicate verts, fix normals, remove degenerate faces |
-        | **Match** | Each mesh is matched to its texture by name similarity scoring |
-        | **Sample** | Texture colour is sampled at every UV vertex → per-vertex colour |
-        | **Visualize** | Plotly renders the fully textured 3D model |
-        | **Export** | Download textured OBJ + textures as ZIP |
-
-        **UV priority:** Uses embedded GLTF UVs first (most accurate).
-        Falls back to xatlas auto-unwrap if a mesh has no UVs.
+        1. Upload your model
+        2. Choose **Low Poly** or **High Poly** in the sidebar
+        3. Click **Run Quad Remesh** — get quad grid flowing over surface
+        4. Click **Run UV Unwrap** — see UV atlas
+        5. Export quad OBJ or UV-mapped OBJ
         """)
     st.stop()
 
+# ── Load + clean ──────────────────────────────────────────────────────────────
+with st.spinner("Loading..."):
+    raw = load_mesh(uploaded)
+if raw is None: st.stop()
+with st.spinner("Cleaning..."):
+    mesh = clean_mesh(raw.copy())
 
-# ════════════════════════════════════════════════════════════════════════════
-#  MAIN PIPELINE
-# ════════════════════════════════════════════════════════════════════════════
-
-# ── Load ─────────────────────────────────────────────────────────────────────
-st.markdown('<div class="step-badge">Step 2 — Loading Scene</div>', unsafe_allow_html=True)
-
-with st.spinner("Loading GLTF scene…"):
-    scene, tmpdir = load_scene(model_files)
-
-if scene is None:
-    st.stop()
-
-total_meshes = sum(1 for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh))
-total_faces  = sum(len(g.faces)    for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh))
-total_verts  = sum(len(g.vertices) for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh))
-meshes_with_uv = sum(
-    1 for g in scene.geometry.values()
-    if isinstance(g, trimesh.Trimesh)
-    and hasattr(g.visual,"uv") and g.visual.uv is not None
-    and len(g.visual.uv) == len(g.vertices)
-)
-
-c1,c2,c3,c4,c5 = st.columns(5)
-for col,(lbl,val) in zip([c1,c2,c3,c4,c5],[
-    ("Mesh parts",  str(total_meshes)),
-    ("Total verts", f"{total_verts:,}"),
-    ("Total faces", f"{total_faces:,}"),
-    ("With UVs",    f"{meshes_with_uv}/{total_meshes}"),
-    ("Textures",    str(len(texture_files))),
+# ── Mesh stats ────────────────────────────────────────────────────────────────
+st.header("📊 Mesh Info")
+bb = mesh.bounds
+for col,(label,val) in zip(st.columns(6),[
+    ("Vertices",   f"{len(mesh.vertices):,}"),
+    ("Faces",      f"{len(mesh.faces):,}"),
+    ("Edges",      f"{len(mesh.edges_unique):,}"),
+    ("Watertight", "✅" if mesh.is_watertight else "❌"),
+    ("Volume",     f"{mesh.volume:.2f}" if mesh.is_watertight else "—"),
+    ("Euler #",    str(mesh.euler_number)),
 ]):
-    col.markdown(f'<div class="stat-card"><div class="stat-val">{val}</div>'
-                 f'<div class="stat-lbl">{lbl}</div></div>', unsafe_allow_html=True)
+    col.markdown(
+        f"<div class='metric-box'>"
+        f"<b style='color:#388bfd;font-size:1.1em'>{val}</b><br>"
+        f"<small style='color:#8b949e'>{label}</small>"
+        f"</div>", unsafe_allow_html=True)
+st.caption(f"Bbox  X[{bb[0,0]:.2f}→{bb[1,0]:.2f}]  Y[{bb[0,1]:.2f}→{bb[1,1]:.2f}]  Z[{bb[0,2]:.2f}→{bb[1,2]:.2f}]")
 
-st.markdown("")
-
-# ── Base mesh preview ─────────────────────────────────────────────────────────
-st.markdown('<div class="step-badge">Step 3 — Base Mesh (no texture)</div>', unsafe_allow_html=True)
-st.plotly_chart(make_plain_fig(scene, "Base Mesh"), use_container_width=True)
-
-# ── UV Atlas ──────────────────────────────────────────────────────────────────
-st.markdown('<div class="step-badge">Step 4 — UV Atlas</div>', unsafe_allow_html=True)
-
-col_uv, col_uvinfo = st.columns([1,1])
-uv_buf = render_uv_atlas(scene)
-with col_uv:
-    st.image(uv_buf, caption="Embedded UV layout from GLTF", use_container_width=True)
-with col_uvinfo:
-    st.markdown(f"""
-    <div class="stat-card" style="text-align:left;padding:20px;height:100%;">
-      <div style="color:#6eaaff;font-family:'Space Mono',monospace;font-size:0.8rem;margin-bottom:12px;">UV STATUS</div>
-      <div style="color:#c9d4f0;font-size:0.85rem;line-height:2.0;">
-        ✅ <b>{meshes_with_uv}</b> mesh(es) — embedded UV coords<br>
-        {'🔧' if meshes_with_uv < total_meshes else '⬛'} <b>{total_meshes - meshes_with_uv}</b> mesh(es) — xatlas fallback<br>
-        🖼 <b>{len(texture_files)}</b> texture image(s) uploaded<br>
-      </div>
-      <div style="color:#4a5a78;font-size:0.75rem;margin-top:14px;">
-        Embedded UVs are read directly from<br>
-        the GLTF binary — no re-unwrapping needed.
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ── Texture matching ───────────────────────────────────────────────────────────
-if not texture_files:
-    st.warning("⚠️ No texture images uploaded. Upload all PNG/JPG files from your `textures/` folder.")
-    st.stop()
-
-st.markdown('<div class="step-badge">Step 5 — Matching & Applying Textures</div>', unsafe_allow_html=True)
-
-with st.spinner("Matching textures to meshes and sampling colours…"):
-    preview_meshes, match_log = apply_textures(scene, texture_files)
-
-ok_count   = sum(1 for r in match_log if r["status"] == "ok")
-miss_count = sum(1 for r in match_log if r["status"] == "miss")
-skip_count = sum(1 for r in match_log if r["status"] == "skip")
-
+# ── Poly mode badge ───────────────────────────────────────────────────────────
+mode_colors = {
+    "Low Poly":  ("#0d2818","#2ea043","Grid res: 8  —  few large quads"),
+    "High Poly": ("#0d1a2e","#388bfd","Grid res: 28  —  many fine quads"),
+    "Custom":    ("#1c1a2e","#a371f7",f"Grid res: {quad_res}  —  custom density"),
+}
+bg,border,desc = mode_colors[poly_mode]
 st.markdown(
-    f"**Results — ✅ {ok_count} textured &nbsp;·&nbsp; "
-    f"❌ {miss_count} unmatched &nbsp;·&nbsp; ⏭ {skip_count} skipped**"
+    f"<div class='poly-card' style='background:{bg};border-color:{border};color:{border}'>"
+    f"{'🟢' if poly_mode=='Low Poly' else '🔵' if poly_mode=='High Poly' else '🟣'} "
+    f"<b>{poly_mode}</b>  —  {desc}</div>",
+    unsafe_allow_html=True
 )
 
-with st.expander("Detailed match log", expanded=(miss_count > 0)):
-    for row in match_log:
-        if row["status"] == "ok":
-            st.markdown(
-                f'<div class="match-ok">✅ <b>{row["mesh"]}</b>'
-                f' → {row["texture"]}'
-                f'&nbsp;&nbsp;<span style="opacity:0.6">[{row["uv_source"]}]'
-                f' · {row["verts"]:,}v · {row["faces"]:,}f</span></div>',
-                unsafe_allow_html=True)
-        elif row["status"] == "miss":
-            st.markdown(
-                f'<div class="match-miss">❌ <b>{row["mesh"]}</b> — {row["reason"]}</div>',
-                unsafe_allow_html=True)
-        else:
-            st.markdown(
-                f'<div class="match-skip">⏭ <b>{row["mesh"]}</b> — {row["reason"]}</div>',
-                unsafe_allow_html=True)
+# ── Run quad remesh ───────────────────────────────────────────────────────────
+st.header("⬛ Structured Quad Remesh")
+bcol,_ = st.columns([1,3])
+with bcol:
+    run_quad = st.button(f"⬛  Run {poly_mode} Quad Remesh")
 
-if not preview_meshes:
-    st.error("No meshes could be textured. "
-             "Make sure texture filenames share keywords with mesh names.")
-    st.stop()
+if run_quad or "quad_done" in st.session_state:
+    if run_quad:
+        with st.spinner(f"Building {poly_mode} quad mesh (res={quad_res}, smooth={smooth_passes})…"):
+            t0 = time.time()
+            try:
+                verts, quads_np, surf_mesh, stats = make_structured_quads(
+                    mesh, res=quad_res, smooth=smooth_passes)
+                elapsed = time.time()-t0
+                st.session_state.update({
+                    "quad_done":  True,
+                    "q_verts":    verts,
+                    "q_quads":    quads_np,
+                    "q_surf":     surf_mesh,
+                    "q_stats":    stats,
+                    "q_elapsed":  elapsed,
+                    "q_mode":     poly_mode,
+                    # clear UV state when remeshed
+                    "uv_done":    False,
+                })
+            except Exception as e:
+                st.error(f"Quad remesh failed: {e}")
+                import traceback
+                with st.expander("Traceback"): st.code(traceback.format_exc())
 
-# ── Textured 3D view ──────────────────────────────────────────────────────────
-st.markdown('<div class="step-badge">Step 6 — Textured 3D Visualization</div>', unsafe_allow_html=True)
+    if st.session_state.get("quad_done"):
+        verts    = st.session_state["q_verts"]
+        quads_np = st.session_state["q_quads"]
+        surf_msh = st.session_state["q_surf"]
+        stats    = st.session_state["q_stats"]
+        elapsed  = st.session_state["q_elapsed"]
+        mode_lbl = st.session_state["q_mode"]
 
-with st.spinner("Rendering textured mesh…"):
-    fig_tex = make_textured_fig(preview_meshes, "Textured Mesh")
+        st.success(
+            f"✅ {mode_lbl} quad mesh  |  "
+            f"**{stats['quad_faces']:,} quads**  |  "
+            f"{stats['vertices']:,} verts  |  "
+            f"{stats['coverage']:.0f}% coverage  |  ⏱ {elapsed:.1f}s"
+        )
 
-st.plotly_chart(fig_tex, use_container_width=True)
+        # Stats row
+        for col,(label,val) in zip(st.columns(5),[
+            ("Mode",          mode_lbl),
+            ("Quads",         f"{stats['quad_faces']:,}"),
+            ("Vertices",      f"{stats['vertices']:,}"),
+            ("Coverage",      f"{stats['coverage']:.0f}%"),
+            ("Orig → Remesh", f"{stats['input_faces']:,} → {stats['tri_faces']:,}"),
+        ]):
+            col.markdown(
+                f"<div class='metric-box'>"
+                f"<b style='color:#388bfd'>{val}</b><br>"
+                f"<small style='color:#8b949e'>{label}</small>"
+                f"</div>", unsafe_allow_html=True)
 
-# Before / After comparison
-st.markdown("**Before vs After**")
-b1, b2 = st.columns(2)
-with b1:
-    st.plotly_chart(make_plain_fig(scene, "Without Texture"), use_container_width=True)
-with b2:
-    st.plotly_chart(fig_tex, use_container_width=True)
+        # ── Side by side viewer ───────────────────────────────────────────────
+        st.subheader("🔍 Original  vs  Quad Remesh")
+        left_col, right_col = st.columns(2)
 
-# ── Texture previews ──────────────────────────────────────────────────────────
-st.markdown('<div class="step-badge">Step 7 — Texture Image Previews</div>', unsafe_allow_html=True)
-preview_cols = st.columns(min(len(texture_files), 5))
-for i, tf in enumerate(texture_files[:10]):
-    with preview_cols[i % len(preview_cols)]:
-        try:
-            tf.seek(0)
-            st.image(Image.open(tf), caption=tf.name, use_container_width=True)
-        except Exception:
-            st.caption(f"⚠️ {tf.name}")
+        with left_col:
+            st.markdown(f"**Original — {len(mesh.faces):,} triangles**")
+            st.plotly_chart(
+                make_original_figure(mesh, f"Original ({len(mesh.faces):,} tris)"),
+                use_container_width=True
+            )
 
-# ── Export ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="step-badge">Step 8 — Export</div>', unsafe_allow_html=True)
+        with right_col:
+            label_3d = (
+                f"Low Poly — {stats['quad_faces']:,} quads"
+                if mode_lbl=="Low Poly" else
+                f"High Poly — {stats['quad_faces']:,} quads"
+                if mode_lbl=="High Poly" else
+                f"Custom — {stats['quad_faces']:,} quads"
+            )
+            st.markdown(f"**{label_3d}**")
+            st.plotly_chart(
+                make_quad_figure(verts, quads_np, surf_msh, label_3d),
+                use_container_width=True
+            )
 
-ec1, ec2 = st.columns(2)
+        # ── UV Unwrap ─────────────────────────────────────────────────────────
+        if show_uv:
+            st.header("🗺️ UV Unwrap")
+            uv_col,_ = st.columns([1,3])
+            with uv_col:
+                run_uv_btn = st.button("▶  Run UV Unwrap")
 
-obj_str = export_obj(preview_meshes)
-ec1.download_button(
-    "⬇ Download Textured OBJ",
-    data=obj_str.encode(),
-    file_name="textured_mesh.obj",
-    mime="text/plain"
-)
+            if run_uv_btn or st.session_state.get("uv_done"):
+                if run_uv_btn:
+                    with st.spinner("UV unwrapping quad mesh…"):
+                        try:
+                            vm, idx2d, uvs = run_uv(surf_msh)
+                            st.session_state.update({
+                                "uv_done":True,"uv_vm":vm,
+                                "uv_idx":idx2d,"uv_uvs":uvs
+                            })
+                        except Exception as e:
+                            st.error(f"UV unwrap failed: {e}")
 
-zip_buf = io.BytesIO()
-with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-    zf.writestr("textured_mesh.obj", obj_str)
-    uv_buf.seek(0)
-    zf.writestr("uv_atlas.png", uv_buf.read())
-    for tf in texture_files:
-        try:
-            tf.seek(0)
-            zf.writestr(f"textures/{tf.name}", tf.read())
-        except Exception:
-            pass
-zip_buf.seek(0)
-ec2.download_button(
-    "⬇ Download All (ZIP)",
-    data=zip_buf.getvalue(),
-    file_name="gltf_texture_export.zip",
-    mime="application/zip"
-)
+                if st.session_state.get("uv_done"):
+                    vm    = st.session_state["uv_vm"]
+                    idx2d = st.session_state["uv_idx"]
+                    uvs   = st.session_state["uv_uvs"]
 
-# Cleanup
-shutil.rmtree(tmpdir, ignore_errors=True)
+                    st.success(f"✅ UV done  |  {len(uvs):,} UV verts  |  {len(idx2d):,} UV tris")
+                    uc, us = st.columns([2,1])
+                    with uc:
+                        st.subheader("UV Atlas Layout")
+                        st.image(uv_figure(uvs, idx2d), use_container_width=True)
+                    with us:
+                        st.subheader("UV Stats")
+                        uv_min=uvs.min(axis=0); uv_max=uvs.max(axis=0)
+                        try:
+                            px=(np.clip(uvs[:,0],0,1)*511).astype(int)
+                            py=(np.clip(uvs[:,1],0,1)*511).astype(int)
+                            g=np.zeros((512,512),bool); g[py,px]=True
+                            cov=g.sum()/g.size
+                        except: cov=0.0
+                        for lbl,val in [
+                            ("UV Verts",  f"{len(uvs):,}"),
+                            ("UV Tris",   f"{len(idx2d):,}"),
+                            ("Coverage",  f"{cov*100:.1f}%"),
+                            ("U range",   f"{uv_min[0]:.2f}→{uv_max[0]:.2f}"),
+                            ("V range",   f"{uv_min[1]:.2f}→{uv_max[1]:.2f}"),
+                        ]:
+                            st.markdown(
+                                f"<div class='metric-box'>"
+                                f"<b style='color:#388bfd'>{val}</b><br>"
+                                f"<small style='color:#8b949e'>{lbl}</small>"
+                                f"</div>", unsafe_allow_html=True)
+
+        # ── Export ────────────────────────────────────────────────────────────
+        st.header("💾 Export")
+        ec1, ec2, ec3 = st.columns(3)
+
+        quad_obj = export_quad_obj(verts, quads_np, surf_msh.faces)
+        ec1.download_button("⬇ Quad OBJ",
+            quad_obj.encode(), "mesh_quad.obj", "text/plain")
+
+        stl_buf = io.BytesIO()
+        surf_msh.export(stl_buf, file_type="stl"); stl_buf.seek(0)
+        ec2.download_button("⬇ Quad STL",
+            stl_buf.getvalue(), "mesh_quad.stl")
+
+        # ZIP
+        zbuf=io.BytesIO()
+        with zipfile.ZipFile(zbuf,"w",zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mesh_quad.obj", quad_obj)
+            stl_buf.seek(0); zf.writestr("mesh_quad.stl", stl_buf.read())
+            if st.session_state.get("uv_done"):
+                vm=st.session_state["uv_vm"]; idx2d=st.session_state["uv_idx"]
+                uvs_=st.session_state["uv_uvs"]
+                zf.writestr("mesh_uv.obj", export_uv_obj(surf_msh,vm,idx2d,uvs_))
+        zbuf.seek(0)
+        ec3.download_button("⬇ All (ZIP)", zbuf.getvalue(), "mesh_export.zip")
+
+        st.markdown("""<div class='hint-box'>
+        <b>Open in Blender:</b> File → Import → Wavefront (.obj) → <code>mesh_quad.obj</code>
+        — you will see clean quad topology. Switch to Edit Mode + press <b>2</b> to see edge loops.
+        </div>""", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("Pipeline: trimesh · xatlas · PIL · plotly · matplotlib · streamlit")
+st.caption("trimesh · xatlas · plotly · matplotlib · streamlit · fast-simplification")
