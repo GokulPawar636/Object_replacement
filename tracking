@@ -1,0 +1,559 @@
+"""
+Phone Face Tracker v7 — YOLO mask + Objectron‑enhanced tracking
+================================================================
+- Face classification: v6 two‑feature (ratio + brightness)
+- Tracking: Kalman + Hungarian + Objectron rotation consistency
+- Optional 3D landmarks overlay from Objectron (Camera model)
+
+Run: streamlit run phone_face_tracker_v7.py
+"""
+
+import subprocess, sys, importlib, os, tempfile, time, collections
+
+def _pip(pkg, mod=None):
+    try: importlib.import_module(mod or pkg.replace("-","_").split("[")[0])
+    except ImportError:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+for p, m in [("opencv-python","cv2"),("numpy",None),("streamlit",None),
+             ("ultralytics",None),("imageio-ffmpeg","imageio_ffmpeg"),
+             ("filterpy",None),("scipy",None),("mediapipe",None)]:
+    _pip(p, m)
+
+import streamlit as st
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import imageio_ffmpeg
+from filterpy.kalman import KalmanFilter
+from scipy.optimize import linear_sum_assignment
+import mediapipe as mp
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+st.set_page_config(page_title="Phone Face Tracker v7", page_icon="📱", layout="wide")
+st.title("📱 Phone Face Tracker v7 — Objectron‑Enhanced Tracking")
+st.caption("Mask classification (ratio+brightness) + Kalman filter + Objectron rotation consistency")
+
+@st.cache_resource(show_spinner=False)
+def load_yolo():
+    return YOLO("yolov8m-seg.pt")
+
+@st.cache_resource(show_spinner=False)
+def load_objectron():
+    mp_obj = mp.solutions.objectron
+    return mp_obj.Objectron(
+        static_image_mode=False,
+        max_num_objects=1,
+        min_detection_confidence=0.3,
+        min_tracking_confidence=0.8,
+        model_name='Camera',            # closest to phone shape
+        focal_length=(1.0, 1.0),
+        principal_point=(0.5, 0.5),
+        image_size=(1, 1),
+    )
+
+with st.spinner("Loading models…"):
+    yolo = load_yolo()
+    objectron = load_objectron()
+st.success("✅ Ready")
+st.divider()
+
+st.subheader("⚙️ Settings")
+c1, c2, c3 = st.columns(3)
+with c1:
+    conf      = st.slider("YOLO confidence", 0.10, 0.80, 0.30, 0.05)
+    out_w     = st.selectbox("Output width", [540, 720, 1080], index=1)
+with c2:
+    max_lost  = st.slider("Track memory (frames)", 5, 60, 25)
+    ar_mode   = st.selectbox("AR overlay", ["Box + Label", "Axes + Label", "Label only"])
+with c3:
+    mask_mode = st.selectbox("Mask shape", ["Rotated rect", "Convex hull"])
+    smooth_n  = st.slider("Label smoothing (frames)", 1, 15, 7)
+
+st.divider()
+c4, c5 = st.columns(2)
+with c4:
+    rot_cost_w = st.slider("Objectron rotation cost weight", 0.0, 1.0, 0.3,
+                           help="0 = pure IoU tracking, >0 adds rotation difference")
+with c5:
+    show_obj_landmarks = st.checkbox("Show Objectron 3D landmarks", True)
+
+st.divider()
+
+# =============================================================================
+# MASK (from v6)
+# =============================================================================
+
+def make_phone_mask(raw_float, orig_w, orig_h, mode):
+    if raw_float.shape[:2] != (orig_h, orig_w):
+        raw_float = cv2.resize(raw_float, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+    binary = (raw_float >= 0.5).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    largest = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 300:
+        return None
+    out = np.zeros((orig_h, orig_w), dtype=np.uint8)
+    if "Rotated rect" in mode:
+        box = cv2.boxPoints(cv2.minAreaRect(largest)).astype(np.intp)
+        cv2.fillPoly(out, [box], 255)
+    else:
+        cv2.fillPoly(out, [cv2.convexHull(largest)], 255)
+    return out
+
+# =============================================================================
+# PHONE FACE CLASSIFIER (v6 scale‑invariant)
+# =============================================================================
+
+EDGE_RATIO_THR  = 0.37
+BRIGHT_VAL_MIN  = 140
+
+def _get_rect_dims(mask):
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    largest = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 200:
+        return None
+    rect = cv2.minAreaRect(largest)
+    (cx, cy), (rw, rh), angle = rect
+    box2d = cv2.boxPoints(rect)
+    return rw, rh, angle, cx, cy, box2d
+
+def _inner_hsv(frame, mask):
+    area = int(np.sum(mask > 0))
+    radius = max(3, min(12, int(np.sqrt(area) * 0.05)))
+    k = np.ones((radius * 2 + 1,) * 2, np.uint8)
+    inner = cv2.erode(mask, k, iterations=1)
+    if np.sum(inner > 0) < 150:
+        inner = mask
+    pixels = frame[inner > 0]
+    hsv = cv2.cvtColor(pixels.reshape(-1, 1, 3),
+                       cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(float)
+    return hsv
+
+def _which_edge(rw, rh, angle, box2d, cx, cy, fw, fh):
+    if rh >= rw:   # portrait → side edge
+        sorted_y = box2d[np.argsort(box2d[:, 1])]
+        top2 = sorted_y[:2]
+        left_top = top2[np.argmin(top2[:, 0])]
+        right_top = top2[np.argmax(top2[:, 0])]
+        if abs(left_top[1] - right_top[1]) < 5:
+            return "Right Edge" if cx < fw * 0.5 else "Left Edge"
+        return "Right Edge" if right_top[1] < left_top[1] else "Left Edge"
+    else:          # landscape → top/bottom edge
+        return "Top Edge" if cy < fh * 0.5 else "Bottom Edge"
+
+def classify_phone_face(frame, mask):
+    dims = _get_rect_dims(mask)
+    if dims is None:
+        return "Front (Screen)"
+    rw, rh, angle, cx, cy, box2d = dims
+    fh, fw = frame.shape[:2]
+    short = min(rw, rh); long_ = max(rw, rh)
+    ratio = short / max(long_, 1.0)
+    hsv = _inner_hsv(frame, mask)
+    mean_val = float(hsv[:, 2].mean()) if len(hsv) else 0.0
+    bright = mean_val >= BRIGHT_VAL_MIN
+    if ratio < EDGE_RATIO_THR:
+        if bright:
+            return _which_edge(rw, rh, angle, box2d, cx, cy, fw, fh)
+        else:
+            return "Back"
+    else:
+        return "Front (Screen)" if bright else "Back"
+
+FACE_COLORS = {
+    "Front (Screen)": (0, 220, 80), "Back": (50, 120, 255),
+    "Left Edge": (255, 160, 0), "Right Edge": (255, 55, 55),
+    "Top Edge": (200, 200, 0), "Bottom Edge": (160, 0, 220),
+}
+
+# =============================================================================
+# OBJECTRON HELPERS (3D rotation, landmarks)
+# =============================================================================
+
+def run_objectron_on_crop(frame_bgr, bbox_xyxy, pad_pct=0.10):
+    h, w = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = map(int, bbox_xyxy)
+    pw = int((x2 - x1) * pad_pct)
+    ph = int((y2 - y1) * pad_pct)
+    x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
+    x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None, None
+    crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    res = objectron.process(crop_rgb)
+    if not res.detected_objects:
+        return None, None
+    obj = res.detected_objects[0]
+    R = np.array(obj.rotation).reshape(3, 3)
+    return R, obj
+
+def rotation_matrix_to_angle_axis(R):
+    """Convert 3x3 rotation matrix to angle-axis vector (axis * angle)."""
+    theta = np.arccos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0))
+    if theta < 1e-6:
+        return np.zeros(3)
+    rx = (R[2,1] - R[1,2]) / (2 * np.sin(theta))
+    ry = (R[0,2] - R[2,0]) / (2 * np.sin(theta))
+    rz = (R[1,0] - R[0,1]) / (2 * np.sin(theta))
+    return np.array([rx, ry, rz]) * theta
+
+def angle_between_rotations(R1, R2):
+    """Geodesic angle (radians) between two rotation matrices."""
+    # Relative rotation: R1^T * R2
+    R_rel = R1.T @ R2
+    trace = np.clip((np.trace(R_rel) - 1) / 2, -1.0, 1.0)
+    return np.arccos(trace)
+
+# =============================================================================
+# POSE / AR DRAWING (from v6)
+# =============================================================================
+
+PH_W, PH_H = 3.75, 8.0
+PHONE_3D = np.float64([[-PH_W,-PH_H,0],[PH_W,-PH_H,0],
+                       [PH_W, PH_H,0],[-PH_W, PH_H,0]])
+
+def _sort_corners(pts):
+    s = pts.sum(1); d = np.diff(pts, axis=1).ravel()
+    return np.float64([pts[np.argmin(s)], pts[np.argmin(d)],
+                       pts[np.argmax(s)], pts[np.argmax(d)]])
+
+def get_pose_for_ar(mask, ow, oh):
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return None
+    largest = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 200: return None
+    rect = cv2.minAreaRect(largest)
+    box2d = _sort_corners(cv2.boxPoints(rect))
+    f = max(ow, oh) * 1.2
+    K = np.float64([[f,0,ow/2],[0,f,oh/2],[0,0,1]])
+    ok, rv, tv = cv2.solvePnP(PHONE_3D, box2d, K, np.zeros((4,1)),
+                              flags=cv2.SOLVEPNP_ITERATIVE)
+    return (rv, tv, K, box2d) if ok else None
+
+def draw_label(frame, text, pt, color, scale=0.70):
+    font=cv2.FONT_HERSHEY_DUPLEX; thick=2
+    (tw,th),bl = cv2.getTextSize(text,font,scale,thick)
+    x,y = int(pt[0]),int(pt[1])
+    cv2.rectangle(frame,(x-4,y-th-4),(x+tw+4,y+bl+2),(10,10,10),-1)
+    cv2.putText(frame,text,(x,y),font,scale,color,thick,cv2.LINE_AA)
+
+def draw_axes(frame, rv, tv, K, L=40):
+    pts,_=cv2.projectPoints(np.float32([[0,0,0],[L,0,0],[0,L,0],[0,0,L]]),
+                             rv,tv,K,np.zeros((4,1)))
+    p=pts.reshape(-1,2).astype(int); o=tuple(p[0])
+    cv2.arrowedLine(frame,o,tuple(p[1]),(0,40,255),2,tipLength=0.25)
+    cv2.arrowedLine(frame,o,tuple(p[2]),(40,210,40),2,tipLength=0.25)
+    cv2.arrowedLine(frame,o,tuple(p[3]),(255,120,0),2,tipLength=0.25)
+
+def draw_3d_box(frame, rv, tv, K):
+    w,h,d=PH_W,PH_H,0.5
+    pts3d=np.float32([[-w,-h,0],[w,-h,0],[w,h,0],[-w,h,0],
+                      [-w,-h,-d],[w,-h,-d],[w,h,-d],[-w,h,-d]])
+    p2d,_=cv2.projectPoints(pts3d,rv,tv,K,np.zeros((4,1)))
+    p=p2d.reshape(-1,2).astype(int)
+    cv2.polylines(frame,[p[:4]],True,(0,255,180),2)
+    cv2.polylines(frame,[p[4:]],True,(0,180,255),2)
+    for i in range(4): cv2.line(frame,tuple(p[i]),tuple(p[i+4]),(180,220,255),1)
+
+def draw_objectron_landmarks(frame, obj, crop_x1, crop_y1, crop_w, crop_h):
+    """Map Objectron 2D landmarks back to original frame coordinates."""
+    for lm in obj.landmarks_2d.landmark:
+        px = int(crop_x1 + lm.x * crop_w)
+        py = int(crop_y1 + lm.y * crop_h)
+        cv2.circle(frame, (px, py), 3, (0, 255, 200), -1)
+    conns = mp.solutions.objectron.BOX_CONNECTIONS
+    lms = obj.landmarks_2d.landmark
+    for c in conns:
+        p1 = (int(crop_x1 + lms[c[0]].x * crop_w),
+              int(crop_y1 + lms[c[0]].y * crop_h))
+        p2 = (int(crop_x1 + lms[c[1]].x * crop_w),
+              int(crop_y1 + lms[c[1]].y * crop_h))
+        cv2.line(frame, p1, p2, (0, 200, 255), 1)
+
+def draw_debug_ratio(frame, mask, face_label, color):
+    dims = _get_rect_dims(mask)
+    if dims is None: return
+    rw, rh, angle, cx, cy, _ = dims
+    short = min(rw, rh); long_ = max(rw, rh)
+    ratio = short / max(long_, 1.0)
+    text = f"r={ratio:.2f}"
+    draw_label(frame, text, (int(cx)-30, int(cy)), (200,200,200), scale=0.42)
+
+# =============================================================================
+# TRACKER (Kalman + Hungarian + Objectron rotation cost)
+# =============================================================================
+
+class Track:
+    _ctr = 0
+    def __init__(self, bbox, face, rot_vec=None, buf_size=7):
+        Track._ctr += 1
+        self.id = Track._ctr
+        self.lost = 0
+        self.hits = 1
+        self.face = face
+        self.color = tuple(int(x) for x in np.random.randint(80, 230, 3))
+        self._buf = collections.deque([face], maxlen=buf_size)
+        self._rot_vec = rot_vec if rot_vec is not None else np.zeros(3)
+        self._init_kf(bbox)
+
+    def _init_kf(self, bbox):
+        kf = KalmanFilter(dim_x=8, dim_z=4)
+        kf.F = np.eye(8)
+        for i in range(4): kf.F[i, i+4] = 1.0
+        kf.H = np.zeros((4,8)); np.fill_diagonal(kf.H, 1)
+        kf.R *= 10; kf.P[4:,4:] *= 1000; kf.Q[4:,4:] *= 0.01
+        kf.x[:4] = np.array(bbox, dtype=float).reshape(4,1)
+        self.kf = kf
+
+    @property
+    def bbox(self):
+        return self.kf.x[:4].ravel()
+
+    @property
+    def smooth_face(self):
+        return max(set(self._buf), key=list(self._buf).count)
+
+    def predict(self):
+        self.kf.predict()
+        self.lost += 1
+
+    def update(self, bbox, face, rot_vec=None):
+        self.kf.update(np.array(bbox, dtype=float))
+        self.lost = 0; self.hits += 1
+        self.face = face; self._buf.append(face)
+        if rot_vec is not None:
+            self._rot_vec = rot_vec
+
+def _iou(b1, b2):
+    ix1=max(b1[0],b2[0]); iy1=max(b1[1],b2[1])
+    ix2=min(b1[2],b2[2]); iy2=min(b1[3],b2[3])
+    inter=max(0.,ix2-ix1)*max(0.,iy2-iy1)
+    a1=max(1e-6,(b1[2]-b1[0])*(b1[3]-b1[1]))
+    a2=max(1e-6,(b2[2]-b2[0])*(b2[3]-b2[1]))
+    return inter/(a1+a2-inter)
+
+def rotation_cost(rot_a, rot_b):
+    """Cost based on angle between rotation vectors (0 = identical)."""
+    if rot_a is None or rot_b is None:
+        return 0.0
+    angle = np.linalg.norm(rot_a - rot_b)  # simple Euclidean in angle-axis space
+    return min(1.0, angle / np.pi)         # normalize to [0,1]
+
+class Tracker:
+    def __init__(self, max_lost=25, iou_thr=0.20, max_tracks=5, rot_weight=0.3):
+        self.tracks = []
+        self.max_lost = max_lost
+        self.iou_thr = iou_thr
+        self.max_tracks = max_tracks
+        self.rot_weight = rot_weight
+
+    def step(self, detections):
+        """detections: list of (bbox, face, mask, rot_vec, obj)"""
+        for t in self.tracks: t.predict()
+        used_t, used_d = set(), set()
+        if self.tracks and detections:
+            cost = np.zeros((len(self.tracks), len(detections)))
+            for ti, t in enumerate(self.tracks):
+                for di, (bbox, face, mask, rot_vec, obj) in enumerate(detections):
+                    iou = _iou(t.bbox, bbox)
+                    rot = rotation_cost(t._rot_vec, rot_vec) if rot_vec is not None else 0.0
+                    # combined cost: 1 - (IoU - rot_weight * rot)
+                    combined = iou - self.rot_weight * rot
+                    cost[ti, di] = 1.0 - combined
+            ri, ci = linear_sum_assignment(cost)
+            for ti, di in zip(ri, ci):
+                if 1.0 - cost[ti, di] >= self.iou_thr:
+                    bbox, face, mask, rot_vec, obj = detections[di]
+                    self.tracks[ti].update(bbox, face, rot_vec)
+                    used_t.add(ti); used_d.add(di)
+        for di, det in enumerate(detections):
+            if di not in used_d and len(self.tracks) < self.max_tracks:
+                bbox, face, mask, rot_vec, obj = det
+                self.tracks.append(Track(bbox, face, rot_vec))
+        self.tracks = [t for t in self.tracks if t.lost <= self.max_lost]
+        return [t for t in self.tracks if t.hits >= 2 or t.lost == 0]
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def process(video_path, conf, mask_mode, out_w, ar_mode, max_lost, smooth_n,
+            rot_weight, show_obj_landmarks):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    ow = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    oh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    scale = out_w / max(ow, 1)
+    out_h = int(oh * scale) & ~1
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    writer = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
+
+    Track._ctr = 0
+    tracker = Tracker(max_lost=max_lost, rot_weight=rot_weight)
+    prog = st.progress(0); preview = st.empty()
+    t0 = time.time(); fi = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        results = yolo(frame, conf=conf, verbose=False)[0]
+        dets = []
+
+        if results.masks is not None and results.boxes is not None:
+            candidates = []
+            for i, cls in enumerate(results.boxes.cls.cpu().numpy()):
+                if yolo.names[int(cls)].lower() != "cell phone": continue
+                mf = results.masks.data[i].cpu().numpy()
+                mask = make_phone_mask(mf, ow, oh, mask_mode)
+                if mask is None: continue
+                area = int(np.sum(mask > 0))
+                bbox = results.boxes.xyxy[i].cpu().numpy().tolist()
+                candidates.append((area, bbox, mask))
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for area, bbox, mask in candidates[:3]:
+                # v6 classification
+                face = classify_phone_face(frame, mask)
+
+                # Objectron on crop (for rotation & landmarks)
+                rot_vec = None
+                obj = None
+                if rot_weight > 0 or show_obj_landmarks:
+                    R, obj_tmp = run_objectron_on_crop(frame, bbox, pad_pct=0.10)
+                    if R is not None:
+                        rot_vec = rotation_matrix_to_angle_axis(R)
+                        obj = obj_tmp
+                dets.append((bbox, face, mask, rot_vec, obj))
+
+        tracks = tracker.step(dets)
+        dbg = frame.copy()
+
+        # Build lookup for masks and Objectron data
+        lookup = {tuple(bbox): (mask, face, rot_vec, obj) for (bbox, face, mask, rot_vec, obj) in dets}
+
+        for t in tracks:
+            best_key, best_iou = None, 0.0
+            for key in lookup:
+                iou = _iou(t.bbox, list(key))
+                if iou > best_iou: best_iou, best_key = iou, key
+
+            face_label = t.smooth_face
+            color = FACE_COLORS.get(face_label, t.color)
+
+            if best_key and best_iou > 0.1:
+                mask, _, rot_vec, obj = lookup[best_key]
+
+                # Mask overlay
+                ov = np.zeros_like(dbg); ov[mask>0] = color
+                dbg = cv2.addWeighted(dbg, 1.0, ov, 0.28, 0)
+
+                # Contour
+                cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(dbg, cnts, -1, color, 2)
+
+                # Debug ratio
+                draw_debug_ratio(dbg, mask, face_label, color)
+
+                # AR from v6 (pose from mask)
+                if ar_mode != "Label only":
+                    pose = get_pose_for_ar(mask, ow, oh)
+                    if pose:
+                        rv, tv, K, box2d = pose
+                        cv2.polylines(dbg, [box2d.astype(int)], True, color, 2)
+                        if ar_mode == "Axes + Label":
+                            draw_axes(dbg, rv, tv, K)
+                        elif ar_mode == "Box + Label":
+                            draw_axes(dbg, rv, tv, K)
+                            draw_3d_box(dbg, rv, tv, K)
+
+                # Objectron landmarks (if enabled and available)
+                if show_obj_landmarks and obj is not None and best_key is not None:
+                    x1,y1,x2,y2 = map(int, best_key)
+                    pw = int((x2-x1)*0.10); ph = int((y2-y1)*0.10)
+                    cx1 = max(0, x1-pw); cy1 = max(0, y1-ph)
+                    cx2 = min(ow, x2+pw); cy2 = min(oh, y2+ph)
+                    draw_objectron_landmarks(dbg, obj, cx1, cy1, cx2-cx1, cy2-cy1)
+
+            # Bounding box and labels
+            x1,y1,x2,y2 = map(int, t.bbox)
+            cv2.rectangle(dbg,(x1,y1),(x2,y2),color,2)
+            draw_label(dbg, f"ID {t.id}", (x1, y1-10), color, scale=0.60)
+            draw_label(dbg, face_label,   (x1, y2+26), color, scale=0.80)
+
+        out_frame = cv2.resize(dbg, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        writer.write(out_frame)
+
+        fi += 1
+        elapsed = time.time()-t0
+        fps_e = fi/max(elapsed,1e-3)
+        eta = (total-fi)/max(fps_e,1e-3)
+        prog.progress(min(fi/total,1.0),
+                      text=f"Frame {fi}/{total} · {fps_e:.1f} fps · ETA {eta:.0f}s")
+        if fi % 20 == 0:
+            preview.image(cv2.cvtColor(out_frame,cv2.COLOR_BGR2RGB),
+                          caption="Preview", use_container_width=True)
+
+    cap.release(); writer.release(); prog.empty(); preview.empty()
+
+    final = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    subprocess.run([FFMPEG,"-y","-i",tmp,"-c:v","libx264","-preset","fast",
+                    "-crf","18","-movflags","+faststart",final],
+                   capture_output=True, check=False)
+    os.unlink(tmp)
+    return final, fi, time.time()-t0
+
+# =============================================================================
+# UI
+# =============================================================================
+
+uploaded = st.file_uploader("📹 Upload video", type=["mp4","avi","mov","mkv"])
+if uploaded:
+    st.video(uploaded)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(uploaded.read()); tmp_path = tmp.name
+
+    if st.button("▶️ Run", type="primary", use_container_width=True):
+        out_vid, n, elapsed = process(tmp_path, conf, mask_mode, out_w, ar_mode,
+                                      max_lost, smooth_n, rot_cost_w, show_obj_landmarks)
+        st.success(f"✅ {n} frames · {elapsed:.1f}s · {n/elapsed:.1f} fps")
+        with open(out_vid,"rb") as f:
+            st.download_button("📥 Download output", f.read(),
+                               "phone_face_tracker_v7.mp4","video/mp4",
+                               use_container_width=True)
+        os.unlink(out_vid)
+    try: os.unlink(tmp_path)
+    except: pass
+
+st.divider()
+st.markdown(f"""
+### How it works
+
+- **Face classification** (v6): Two‑feature rule – aspect ratio + brightness.  
+  Ratio < {EDGE_RATIO_THR} → narrow (edge or back), then brightness decides edge vs back.  
+  Ratio ≥ {EDGE_RATIO_THR} → wide (front/back), brightness decides front vs back.
+
+- **Tracking enhancement** (Objectron):  
+  For each detection, MediaPipe Objectron (Camera model) provides a 3×3 rotation matrix.  
+  The rotation is converted to an angle‑axis vector.  
+  The association cost between a track and a detection becomes:  
+  `cost = 1 - (IoU - rot_weight * rotation_similarity)`.  
+  This makes tracking more stable when phones rotate quickly.
+
+- **AR overlays**:  
+  – From v6: 3D axes and bounding box (solvePnP from mask).  
+  – Optional: Objectron’s 3D landmarks (white/yellow wireframe).
+
+Set `rot_weight = 0` to use pure IoU tracking (v6 behaviour).  
+Increase it to rely more on rotation consistency.
+""")
